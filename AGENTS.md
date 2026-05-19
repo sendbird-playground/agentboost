@@ -9,6 +9,7 @@ AgentBoost is a public-candidate macOS menu-bar app extracted from the private `
 - Run `scripts/privacy-scan.sh` before any public push.
 - Keep app behavior testable through `--state-json`, `--check`, and product-quality checks before relying on manual menu-bar inspection.
 - Do not add or upgrade third-party packages without a package-age/cooldown check.
+- For menu-bar CPU/performance work, verify the rebuilt and restarted installed `AgentBoost.app` with live `ps`/`sample` evidence. Keep full lifetime backfills, recursive session scans, BEAM state rebuilds, and usage collectors off status-item clicks, timers, and active-agent startup paths; cache status glyphs, file scans, and process scans when they feed animation.
 
 ## Verification
 
