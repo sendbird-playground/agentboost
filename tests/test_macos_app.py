@@ -1021,6 +1021,24 @@ class MacOSAppBundleTest(unittest.TestCase):
         self.assertIn("let textX = point.x - textSize.width / 2", overlay_body)
         self.assertNotIn("let textX = min(max(bounds.minX + 2", overlay_body)
 
+    def test_status_item_caches_rocket_and_token_glyph_images_for_cpu(self):
+        source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
+        status_body = source.split("final class RocketStatusView", 1)[1].split("final class RocketScreensaverView", 1)[0]
+        emoji_body = status_body.split("private func drawEmojiRocket", 1)[1].split("private func cachedRocketImage", 1)[0]
+        token_body = status_body.split("private func drawTokenText", 1)[1].split("private func cachedTokenTextImage", 1)[0]
+
+        self.assertIn("private var rocketImageCache: [String: NSImage] = [:]", status_body)
+        self.assertIn("private var tokenTextImageCache: [String: NSImage] = [:]", status_body)
+        self.assertIn("private func cachedRocketImage(scale: CGFloat, tint: NSColor) -> NSImage", status_body)
+        self.assertIn("private func cachedTokenTextImage(_ value: String) -> NSImage", status_body)
+        self.assertIn("private func colorCacheKey(_ color: NSColor) -> String", status_body)
+        self.assertIn("let image = cachedRocketImage(scale: scale, tint: tint)", emoji_body)
+        self.assertIn("image.draw(", emoji_body)
+        self.assertNotIn("rocketEmoji.draw(", emoji_body)
+        self.assertIn("let image = cachedTokenTextImage(value)", token_body)
+        self.assertIn("image.draw(", token_body)
+        self.assertNotIn("tokenText.draw(", token_body)
+
     def test_rocket_screensaver_token_text_clips_with_rocket_at_window_edge(self):
         source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
         overlay_body = source.split("final class RocketScreensaverView", 1)[1].split("final class AppDelegate", 1)[0]
@@ -1107,9 +1125,11 @@ class MacOSAppBundleTest(unittest.TestCase):
         live_body = source.split("func loadLiveUsageState", 1)[1].split("func readRecentEvents", 1)[0]
         recent_body = source.split("func recentTokenActivity", 1)[1].split("func statusViews", 1)[0]
 
-        self.assertIn("let recentCutoff = now.addingTimeInterval(-10 * 60)", live_body)
+        self.assertIn("private let liveUsageRecentWindowSeconds: TimeInterval = 2 * 60", source)
+        self.assertIn("let recentCutoff = now.addingTimeInterval(-liveUsageRecentWindowSeconds)", live_body)
         self.assertIn("let liveRecentEvents = liveRecentUsageEvents(since: recentCutoff", live_body)
-        self.assertIn("mergeUsageEvents(readRecentEvents(dataRoot: dataRoot, since: recentCutoff), with: liveRecentEvents)", live_body)
+        self.assertIn("let recentEvents = liveRecentEvents", live_body)
+        self.assertNotIn("readRecentEvents(dataRoot: dataRoot, since: recentCutoff)", live_body)
         self.assertIn("let statusEvents = recentEvents", live_body)
         self.assertNotIn("readStatusEvents(dataRoot: dataRoot)", live_body)
         self.assertIn("let statusRollups = buildRollups(events: statusEvents)", live_body)
@@ -1145,19 +1165,40 @@ class MacOSAppBundleTest(unittest.TestCase):
         self.assertIn("KERN_PROCARGS2", source)
         self.assertIn("func shouldInspectProcessCommandLine(_ command: String) -> Bool", source)
         self.assertIn("guard shouldInspectProcessCommandLine(command) else", source)
-        self.assertIn("let runningActivity = runningAgentActivity()", live_body)
+        self.assertIn("let runningActivity = cachedRunningAgentActivity()", live_body)
         self.assertIn('"running_agent_activity": runningActivity', live_body)
         self.assertIn(
             "statusAnimationActivity(recent: recentActivity, today: todayActivity, network: networkActivityState, running: runningActivity)",
             live_body,
         )
         self.assertIn("private var runningAgentRefreshTimer: Timer?", app_body)
+        self.assertIn("private let runningAgentQueue = DispatchQueue", app_body)
+        self.assertIn("private var runningAgentRefreshInFlight = false", app_body)
         self.assertIn("private var lastRenderedState: [String: Any] = [:]", app_body)
         self.assertIn("startRunningAgentRefreshTimer()", app_body)
-        self.assertIn("timeInterval: 1", app_body)
+        self.assertIn("private let runningAgentRefreshIntervalSeconds: TimeInterval = 15", source)
+        self.assertIn("timeInterval: runningAgentRefreshIntervalSeconds", app_body)
+        self.assertIn("runningAgentQueue.async", running_refresh_body)
+        self.assertIn("guard !runningAgentRefreshInFlight", running_refresh_body)
+        self.assertIn("private let runningAgentActivityCacheIntervalSeconds: TimeInterval = 60", source)
+        self.assertIn("func cachedRunningAgentActivity() -> [String: Any]", source)
+        self.assertIn("private var runningAgentActivityCache:", source)
+        self.assertIn("let running = cachedRunningAgentActivity()", running_refresh_body)
         self.assertIn("stateByApplyingRunningAgents(lastRenderedState, running: running)", running_refresh_body)
         self.assertIn("applyAnimationState(renderedState)", running_refresh_body)
         self.assertNotIn("loadLiveUsageState", running_refresh_body)
+
+    def test_running_agent_activity_uses_sysctl_hints_without_appkit_metadata_scan(self):
+        source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
+        running_body = source.split("func runningAgentActivity() -> [String: Any]", 1)[1].split("func runningProcessHints()", 1)[0]
+
+        self.assertIn("let hints = runningProcessHints()", running_body)
+        self.assertIn("for hint in hints", running_body)
+        self.assertNotIn("NSWorkspace.shared.runningApplications", running_body)
+        self.assertNotIn("application.localizedName", running_body)
+        self.assertNotIn("application.bundleIdentifier", running_body)
+        self.assertNotIn("application.bundleURL", running_body)
+        self.assertNotIn("application.executableURL", running_body)
 
     def test_rocket_screensaver_rotates_token_mode_only_after_connected_display_cycle(self):
         source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
@@ -1427,7 +1468,7 @@ class MacOSAppBundleTest(unittest.TestCase):
         status_activity_body = source.split("func statusAnimationActivity", 1)[1].split("func xp", 1)[0]
 
         self.assertIn("let networkActivityState = networkActivity()", build_state_body)
-        self.assertIn("let runningActivity = runningAgentActivity()", build_state_body)
+        self.assertIn("let runningActivity = cachedRunningAgentActivity()", build_state_body)
         self.assertIn('"network_activity": networkActivityState', build_state_body)
         self.assertIn('"running_agent_activity": runningActivity', build_state_body)
         self.assertIn(
@@ -1485,7 +1526,7 @@ class MacOSAppBundleTest(unittest.TestCase):
     def test_status_item_refreshes_activity_state_periodically(self):
         source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
 
-        self.assertIn("private let minimumUsageRefreshIntervalSeconds: TimeInterval = 5", source)
+        self.assertIn("private let minimumUsageRefreshIntervalSeconds: TimeInterval = 30", source)
         self.assertIn("private var stateRefreshTimer: Timer?", source)
         self.assertIn("private let stateQueue = DispatchQueue", source)
         self.assertIn("private var stateRefreshInFlight = false", source)
@@ -1509,7 +1550,8 @@ class MacOSAppBundleTest(unittest.TestCase):
         source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
         launch_body = source.split("func applicationDidFinishLaunching", 1)[1].split("private func startStateRefreshTimer", 1)[0]
         menu_body = source.split("@objc private func refreshMenu", 1)[1].split("private func configureStatusAnimation", 1)[0]
-        refresh_body = source.split("private func refreshStateInBackground", 1)[1].split("private func applyState", 1)[0]
+        refresh_body = source.split("private func refreshStateInBackground", 1)[1].split("private func loadAndCacheFullDisplayState", 1)[0]
+        full_refresh_body = source.split("private func loadAndCacheFullDisplayState", 1)[1].split("private func applyState", 1)[0]
         load_state_body = source.split("func loadState(refreshUsage: Bool = true)", 1)[1].split("func activeDataRoot", 1)[0]
         display_state_body = source.split("func loadDisplayState(refreshUsage: Bool = true)", 1)[1].split("func stateByMergingLiveUsage", 1)[0]
         merge_body = source.split("func stateByMergingLiveUsage", 1)[1].split("func activeDataRoot", 1)[0]
@@ -1525,8 +1567,14 @@ class MacOSAppBundleTest(unittest.TestCase):
         self.assertIn("let liveState = loadLiveUsageState(refreshUsage: false)", refresh_body)
         self.assertIn("let fastState = cachedState.isEmpty ? liveState : stateByMergingLiveUsage(cachedState, liveState: liveState)", refresh_body)
         self.assertIn("self.applyState(fastState)", refresh_body)
-        self.assertIn("refreshUsageIfPossible(dataRoot: dataRoot)", refresh_body)
-        self.assertIn("let finalState = loadDisplayState(refreshUsage: false)", refresh_body)
+        self.assertNotIn("refreshUsageIfPossible(dataRoot: dataRoot)", refresh_body)
+        self.assertNotIn("collectUsageFromSelectedAgentFolders(dataRoot: dataRoot, since:", refresh_body)
+        self.assertIn("let refreshedLiveState = loadLiveUsageState(refreshUsage: false)", refresh_body)
+        self.assertIn("let finalState = stateByMergingLiveUsage(fastState, liveState: refreshedLiveState)", refresh_body)
+        self.assertNotIn("loadDisplayState(refreshUsage: false)", refresh_body)
+        self.assertNotIn("writeCachedDisplayState", refresh_body)
+        self.assertIn("let finalState = loadDisplayState(refreshUsage: false)", full_refresh_body)
+        self.assertIn("writeCachedDisplayState(finalState, dataRoot: dataRoot)", full_refresh_body)
         self.assertIn("refreshUsageIfPossible(dataRoot: dataRoot)", load_state_body)
         self.assertIn("let fullState = loadState(refreshUsage: refreshUsage)", display_state_body)
         self.assertIn("let liveState = loadLiveUsageState(refreshUsage: false)", display_state_body)
@@ -1569,13 +1617,20 @@ class MacOSAppBundleTest(unittest.TestCase):
         self.assertIn("AgentBoostBeamRuntime.json", source)
         self.assertNotIn("runHelper", source)
 
-    def test_native_beam_bridge_drains_state_json_before_waiting_for_exit(self):
+    def test_native_beam_bridge_times_out_and_terminates_slow_state_process(self):
         source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
         beam_body = source.split("func loadBeamRuntimeState(dataRoot:", 1)[1].split("func elixirStringLiteral", 1)[0]
 
-        read_index = beam_body.index("stdout.fileHandleForReading.readDataToEndOfFile()")
-        wait_index = beam_body.index("process.waitUntilExit()")
-        self.assertLess(read_index, wait_index)
+        self.assertIn("private let beamStateTimeoutSeconds", source)
+        self.assertIn("let group = DispatchGroup()", beam_body)
+        self.assertIn("process.terminationHandler", beam_body)
+        self.assertIn("group.wait(timeout: .now() + beamStateTimeoutSeconds)", beam_body)
+        self.assertIn("process.terminate()", beam_body)
+        self.assertIn("kill(process.processIdentifier, SIGKILL)", beam_body)
+        self.assertLess(
+            beam_body.index("group.wait(timeout: .now() + beamStateTimeoutSeconds)"),
+            beam_body.index("stdout.fileHandleForReading.readDataToEndOfFile()"),
+        )
 
     def test_native_app_refreshes_usage_without_repo_helper_process(self):
         source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
@@ -1698,7 +1753,7 @@ class MacOSAppBundleTest(unittest.TestCase):
 
     def test_manual_usage_refresh_collects_agent_lifetime_without_recent_file_filter(self):
         source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
-        refresh_body = source.split("private func refreshStateInBackground", 1)[1].split("private func applyState", 1)[0]
+        refresh_body = source.split("private func refreshStateInBackground", 1)[1].split("private func loadAndCacheFullDisplayState", 1)[0]
         collect_body = source.split("func collectUsageFromSelectedAgentFolders", 1)[1].split("func usageEventsFile", 1)[0]
 
         self.assertIn("if forceUsageRefresh", refresh_body)
@@ -1718,8 +1773,13 @@ class MacOSAppBundleTest(unittest.TestCase):
         self.assertLess(launch_body.index("runUsageBackfillOnceInBackground()"), launch_body.index("refreshStateInBackground(refreshUsage: true)"))
         self.assertIn("guard !usageBackfillInFlight", backfill_body)
         self.assertIn("shouldRunUsageBackfill(dataRoot: dataRoot)", backfill_body)
+        self.assertIn("shouldDeferUsageBackfillForActiveAgents()", backfill_body)
+        self.assertLess(backfill_body.index("shouldDeferUsageBackfillForActiveAgents()"), backfill_body.index("collectUsageFromSelectedAgentFolders(dataRoot: dataRoot)"))
+        self.assertIn('"reason": "active_agents_running"', backfill_body)
         self.assertIn("!usageEventsFileHasData(dataRoot: dataRoot)", should_backfill_body)
         self.assertIn("readCachedDisplayState(dataRoot: dataRoot) == nil", should_backfill_body)
+        self.assertIn("func shouldDeferUsageBackfillForActiveAgents() -> Bool", source)
+        self.assertIn('!textArray(cachedRunningAgentActivity()["active_agents"]).isEmpty', source)
         self.assertIn("hasAvailableAgentUsageFolder()", backfill_body)
         self.assertIn("stateQueue.async", backfill_body)
         self.assertIn("collectUsageFromSelectedAgentFolders(dataRoot: dataRoot)", backfill_body)
@@ -1747,7 +1807,8 @@ class MacOSAppBundleTest(unittest.TestCase):
         source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
         launch_body = source.split("func applicationDidFinishLaunching", 1)[1].split("private func startStateRefreshTimer", 1)[0]
         initial_body = source.split("func initialDisplayState", 1)[1].split("func loadState", 1)[0]
-        refresh_body = source.split("private func refreshStateInBackground", 1)[1].split("private func applyState", 1)[0]
+        refresh_body = source.split("private func refreshStateInBackground", 1)[1].split("private func loadAndCacheFullDisplayState", 1)[0]
+        full_refresh_body = source.split("private func loadAndCacheFullDisplayState", 1)[1].split("private func applyState", 1)[0]
 
         self.assertIn("func displayStateCacheFile(dataRoot: URL) -> URL", source)
         self.assertIn("func readCachedDisplayState(dataRoot: URL) -> [String: Any]?", source)
@@ -1758,8 +1819,9 @@ class MacOSAppBundleTest(unittest.TestCase):
         self.assertIn("if let cached = readCachedDisplayState(dataRoot: dataRoot)", initial_body)
         self.assertIn("stateByMergingLiveUsage(cached, liveState: liveState)", initial_body)
         self.assertNotIn("loadDisplayState", initial_body)
-        self.assertIn("writeCachedDisplayState(finalState, dataRoot: dataRoot)", refresh_body)
-        self.assertLess(refresh_body.index("let finalState = loadDisplayState(refreshUsage: false)"), refresh_body.index("writeCachedDisplayState(finalState, dataRoot: dataRoot)"))
+        self.assertNotIn("writeCachedDisplayState(finalState, dataRoot: dataRoot)", refresh_body)
+        self.assertIn("writeCachedDisplayState(finalState, dataRoot: dataRoot)", full_refresh_body)
+        self.assertLess(full_refresh_body.index("let finalState = loadDisplayState(refreshUsage: false)"), full_refresh_body.index("writeCachedDisplayState(finalState, dataRoot: dataRoot)"))
         self.assertNotIn("writeCachedDisplayState(fastState", refresh_body)
 
     def test_selecting_agent_usage_folder_triggers_backfill_retry_when_needed(self):
@@ -1955,18 +2017,45 @@ class MacOSAppBundleTest(unittest.TestCase):
         self.assertIn("if let cutoff, let occurredAt = eventDate(occurredAtRaw), occurredAt < cutoff", project_body)
         self.assertLess(project_body.index("modifiedAt < cutoff"), project_body.index("usageFileContents(path: path, since: cutoff)"))
 
+    def test_native_live_claude_tail_reuses_recent_file_scan_cache(self):
+        source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
+        project_body = source.split("func claudeProjectUsageEvents", 1)[1].split("func claudeSessionMetaUsageEvents", 1)[0]
+        recent_files_body = source.split("func recentClaudeProjectFiles", 1)[1].split("func claudeProjectUsageEvents", 1)[0]
+
+        self.assertIn("private let liveClaudeProjectFileScanIntervalSeconds: TimeInterval = 5 * 60", source)
+        self.assertIn("private var liveClaudeProjectFileCache:", source)
+        self.assertIn("func recentClaudeProjectFiles(claudeRoot: URL, since cutoff: Date) -> [URL]", source)
+        self.assertIn("Date().timeIntervalSince(cache.refreshedAt) < liveClaudeProjectFileScanIntervalSeconds", recent_files_body)
+        self.assertIn("return cache.files", recent_files_body)
+        self.assertIn("recentClaudeProjectFiles(claudeRoot: claudeRoot, since: cutoff)", project_body)
+        self.assertNotIn("FileManager.default.enumerator(at: projectsDir", project_body)
+
     def test_native_live_usage_state_reads_recent_ledger_tail_for_status_refresh(self):
         source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
         live_body = source.split("func loadLiveUsageState", 1)[1].split("func readRecentEvents", 1)[0]
         recent_body = source.split("func readRecentEvents", 1)[1].split("func readEvents", 1)[0]
 
         self.assertIn("func loadLiveUsageState(refreshUsage: Bool = true) -> [String: Any]", source)
-        self.assertIn("readRecentEvents(dataRoot: dataRoot", live_body)
+        self.assertIn("private let liveUsageRecentWindowSeconds: TimeInterval = 2 * 60", source)
+        self.assertIn("let liveRecentEvents = liveRecentUsageEvents(since: recentCutoff", live_body)
+        self.assertIn("let recentEvents = liveRecentEvents", live_body)
+        self.assertNotIn("readRecentEvents(dataRoot: dataRoot", live_body)
         self.assertIn("recentTokenActivity(events: recentEvents)", live_body)
         self.assertIn("statusAnimationActivity(recent: recentActivity", live_body)
         self.assertIn("raw.split(separator: \"\\n\").reversed()", recent_body)
         self.assertIn("else if sawRecentEvent", recent_body)
         self.assertIn("break", recent_body)
+
+    def test_event_date_reuses_cached_iso8601_formatters(self):
+        source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
+        event_date_body = source.split("func eventDate", 1)[1].split("func totalTokens", 1)[0]
+
+        self.assertIn("private let eventDateFormatterLock = NSLock()", source)
+        self.assertIn("private let fractionalEventDateFormatter: ISO8601DateFormatter", source)
+        self.assertIn("private let wholeSecondEventDateFormatter: ISO8601DateFormatter", source)
+        self.assertIn("eventDateFormatterLock.lock()", event_date_body)
+        self.assertIn("defer { eventDateFormatterLock.unlock() }", event_date_body)
+        self.assertNotIn("ISO8601DateFormatter()", event_date_body)
 
     def test_native_live_usage_state_reads_bounded_jsonl_tails_for_animation(self):
         source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
@@ -1976,7 +2065,8 @@ class MacOSAppBundleTest(unittest.TestCase):
         codex_body = source.split("func codexUsageEvents", 1)[1].split("func tokenUsageFromInfo", 1)[0]
         merge_body = source.split("func mergeUsageEvents", 1)[1].split("func readRecentEvents", 1)[0]
 
-        self.assertIn("private let liveUsageTailBytes", source)
+        self.assertIn("private let liveUsageTailBytes = UInt64(512 * 1024)", source)
+        self.assertIn("func sessionSearchRoots(sessionsDir: URL, since cutoff: Date?) -> [URL]", source)
         self.assertIn("FileHandle(forReadingFrom: path)", tail_body)
         self.assertIn("try? handle.seekToEnd()", tail_body)
         self.assertIn("try? handle.seek(toOffset: startOffset)", tail_body)
@@ -1984,9 +2074,26 @@ class MacOSAppBundleTest(unittest.TestCase):
         self.assertIn("if startOffset > 0", tail_body)
         self.assertIn("tailJSONLContents(path: path, maxBytes: liveUsageTailBytes)", usage_body)
         self.assertIn("tailJSONLContents(path: path, maxBytes: liveUsageTailBytes)", recent_body)
+        self.assertIn("for root in sessionSearchRoots(sessionsDir: sessionsDir, since: cutoff)", codex_body)
         self.assertIn("usageFileContents(path: path, since: cutoff)", codex_body)
         self.assertIn("usageEventSignature", merge_body)
         self.assertIn("seenSignatures", merge_body)
+
+    def test_overlay_runtime_snapshot_is_not_written_every_animation_frame(self):
+        source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
+        app_body = source.split("final class AppDelegate", 1)[1]
+        advance_body = app_body.split("@objc private func advanceRocketScreensaverDisplay", 1)[1].split("private func rebuildRocketScreensaverWindows", 1)[0]
+
+        self.assertIn("private let overlayRuntimeSnapshotWriteIntervalSeconds: TimeInterval = 5", source)
+        self.assertIn("private var lastOverlaySnapshotAt: Date = .distantPast", app_body)
+        self.assertIn(
+            "now.timeIntervalSince(lastOverlaySnapshotAt) >= overlayRuntimeSnapshotWriteIntervalSeconds",
+            advance_body,
+        )
+        self.assertLess(
+            advance_body.index("now.timeIntervalSince(lastOverlaySnapshotAt) >= overlayRuntimeSnapshotWriteIntervalSeconds"),
+            advance_body.index("writeOverlayRuntimeSnapshot(enabled: true, capturedAt: now)"),
+        )
 
     def test_rocket_animation_uses_elapsed_time_while_rocket_stays_centered(self):
         source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")
@@ -2106,11 +2213,13 @@ class MacOSAppBundleTest(unittest.TestCase):
         advance_body = overlay_body.split("private func advanceMotion", 1)[1].split("private func updateRocketHeading", 1)[0]
         app_body = source.split("private func startRocketScreensaverDisplayTimer", 1)[1].split("@objc private func advanceRocketScreensaverDisplay", 1)[0]
 
-        self.assertIn("let frameInterval = 1.0 / 60.0", configure_body)
+        self.assertIn("private let rocketStatusFrameIntervalSeconds: TimeInterval = 1.0 / 10.0", source)
+        self.assertIn("let frameInterval = rocketStatusFrameIntervalSeconds", configure_body)
         self.assertNotIn("1.0 / 24.0", configure_body)
-        self.assertIn("timer.tolerance = 1.0 / 240.0", configure_body)
-        self.assertIn("timeInterval: 1.0 / 30.0", app_body)
-        self.assertIn("timer.tolerance = 1.0 / 120.0", app_body)
+        self.assertIn("timer.tolerance = rocketStatusFrameIntervalSeconds / 4", configure_body)
+        self.assertIn("private let rocketScreensaverFrameIntervalSeconds: TimeInterval = 1.0 / 10.0", source)
+        self.assertIn("timeInterval: rocketScreensaverFrameIntervalSeconds", app_body)
+        self.assertIn("timer.tolerance = rocketScreensaverFrameIntervalSeconds / 2", app_body)
         self.assertIn("let maxFrameDelta = CGFloat(1.0 / 30.0)", advance_body)
         self.assertIn("let deltaSeconds = min(maxFrameDelta, max(CGFloat(0), rawDelta))", advance_body)
         self.assertIn("NSGraphicsContext.current?.shouldAntialias = true", status_emoji_body)

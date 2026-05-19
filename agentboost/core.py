@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import sys
@@ -151,6 +152,14 @@ def default_events_file(repo_root: Path) -> Path:
 
 def default_goals_file(repo_root: Path) -> Path:
     return repo_root / "data" / "ai-usage" / "goals.json"
+
+
+def default_usage_refresh_file(repo_root: Path) -> Path:
+    return repo_root / "data" / "ai-usage" / "sidebar-usage-refresh.json"
+
+
+def default_usage_collect_lock_file(repo_root: Path) -> Path:
+    return repo_root / "data" / "ai-usage" / "ai-usage-collect.lock"
 
 
 def utc_now_iso() -> str:
@@ -629,6 +638,56 @@ def collect_usage(
         "skipped_existing": len(candidates) - len(new_events) - len(updated_by_id),
         "events_file": str(events_file),
     }
+
+
+def recent_collect_skip(
+    repo_root: Path,
+    *,
+    min_interval_seconds: int,
+    now: str | None = None,
+) -> dict[str, Any] | None:
+    if min_interval_seconds <= 0:
+        return None
+    refresh_file = default_usage_refresh_file(Path(repo_root))
+    previous = read_json(refresh_file) or {}
+    last_refreshed = str(previous.get("last_refreshed_at") or "")
+    if not last_refreshed:
+        return None
+    current = parse_time(now).replace(microsecond=0)
+    elapsed = (current - parse_time(last_refreshed)).total_seconds()
+    if 0 <= elapsed < min_interval_seconds:
+        return {
+            "skipped": True,
+            "reason": "fresh",
+            "last_refreshed_at": last_refreshed,
+            "min_interval_seconds": min_interval_seconds,
+            "refresh_file": str(refresh_file),
+        }
+    return None
+
+
+def write_usage_refresh_summary(
+    repo_root: Path,
+    *,
+    summary: dict[str, Any],
+    refreshed_at: str,
+    min_interval_seconds: int,
+) -> None:
+    refresh_file = default_usage_refresh_file(Path(repo_root))
+    refresh_file.parent.mkdir(parents=True, exist_ok=True)
+    refresh_file.write_text(
+        json.dumps(
+            {
+                "last_refreshed_at": refreshed_at,
+                "min_interval_seconds": min_interval_seconds,
+                "summary": summary,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def add_goal(
@@ -1378,13 +1437,52 @@ def collect_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--claude-dir", default=Path.home() / ".claude", type=Path)
     parser.add_argument("--codex-dir", default=Path.home() / ".codex", type=Path)
     parser.add_argument("--now", default=None)
+    parser.add_argument("--skip-if-running", action="store_true", help="Exit successfully if another collection is already running for this repo.")
+    parser.add_argument("--min-interval-seconds", type=int, default=0, help="Exit successfully if a collection completed within this interval.")
     args = parser.parse_args(argv)
-    summary = collect_usage(args.repo_root, args.claude_dir, args.codex_dir, args.now)
-    print(
-        f"scanned={summary['scanned']} imported={summary['imported']} "
-        f"updated={summary['updated']} skipped_existing={summary['skipped_existing']} events={summary['events_file']}"
-    )
-    return 0
+    repo_root = Path(args.repo_root)
+    lock_handle = None
+    if args.skip_if_running:
+        lock_file = default_usage_collect_lock_file(repo_root)
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        lock_handle = lock_file.open("w", encoding="utf-8")
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"skipped=running lock={lock_file}")
+            lock_handle.close()
+            return 0
+
+    try:
+        fresh = recent_collect_skip(repo_root, min_interval_seconds=args.min_interval_seconds, now=args.now)
+        if fresh is not None:
+            print(
+                f"skipped=fresh last_refreshed_at={fresh['last_refreshed_at']} "
+                f"min_interval_seconds={fresh['min_interval_seconds']}"
+            )
+            return 0
+
+        summary = collect_usage(repo_root, args.claude_dir, args.codex_dir, args.now)
+        if args.min_interval_seconds > 0:
+            refreshed_at = (
+                parse_time(args.now).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                if args.now
+                else utc_now_iso()
+            )
+            write_usage_refresh_summary(
+                repo_root,
+                summary=summary,
+                refreshed_at=refreshed_at,
+                min_interval_seconds=args.min_interval_seconds,
+            )
+        print(
+            f"scanned={summary['scanned']} imported={summary['imported']} "
+            f"updated={summary['updated']} skipped_existing={summary['skipped_existing']} events={summary['events_file']}"
+        )
+        return 0
+    finally:
+        if lock_handle is not None:
+            lock_handle.close()
 
 
 def goal_main(argv: list[str] | None = None) -> int:

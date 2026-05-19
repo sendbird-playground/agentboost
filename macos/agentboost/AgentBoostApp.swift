@@ -38,9 +38,30 @@ private let rocketScreensaverMinimumWidth = CGFloat(260)
 private let rocketScreensaverMinimumHeight = CGFloat(180)
 private let rocketScreensaverScreenInset = CGFloat(8)
 private let rocketScreensaverSeamTolerance = CGFloat(8)
-private let minimumUsageRefreshIntervalSeconds: TimeInterval = 5
+private let minimumUsageRefreshIntervalSeconds: TimeInterval = 30
+private let runningAgentRefreshIntervalSeconds: TimeInterval = 15
+private let beamStateTimeoutSeconds: TimeInterval = 12
 private let usageRefreshLookbackSeconds: TimeInterval = 2 * 60 * 60
-private let liveUsageTailBytes = UInt64(4 * 1024 * 1024)
+private let liveUsageRecentWindowSeconds: TimeInterval = 2 * 60
+private let liveUsageTailBytes = UInt64(512 * 1024)
+private let liveClaudeProjectFileScanIntervalSeconds: TimeInterval = 5 * 60
+private let overlayRuntimeSnapshotWriteIntervalSeconds: TimeInterval = 5
+private let rocketStatusFrameIntervalSeconds: TimeInterval = 1.0 / 10.0
+private let rocketScreensaverFrameIntervalSeconds: TimeInterval = 1.0 / 10.0
+private let runningAgentActivityCacheIntervalSeconds: TimeInterval = 60
+private var liveClaudeProjectFileCache: (rootPath: String, refreshedAt: Date, files: [URL])?
+private var runningAgentActivityCache: (refreshedAt: Date, state: [String: Any])?
+private let eventDateFormatterLock = NSLock()
+private let fractionalEventDateFormatter: ISO8601DateFormatter = {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter
+}()
+private let wholeSecondEventDateFormatter: ISO8601DateFormatter = {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+    return formatter
+}()
 private let levelXPRequirements: [(level: Int, requiredXP: Int)] = [
     (1, 15),
     (2, 34),
@@ -213,16 +234,30 @@ func loadBeamRuntimeState(dataRoot: URL) -> [String: Any]? {
     let expression = "\(commandPrefix) \"\(elixirStringLiteral(dataRoot.path))\"])"
     let process = Process()
     let stdout = Pipe()
+    defer { try? stdout.fileHandleForReading.close() }
     process.executableURL = executable
     process.arguments = ["eval", expression]
     process.standardOutput = stdout
+    let group = DispatchGroup()
+    process.terminationHandler = { _ in
+        group.leave()
+    }
     do {
+        group.enter()
         try process.run()
     } catch {
+        group.leave()
+        return nil
+    }
+    if group.wait(timeout: .now() + beamStateTimeoutSeconds) == .timedOut {
+        process.terminate()
+        if group.wait(timeout: .now() + 1) == .timedOut {
+            kill(process.processIdentifier, SIGKILL)
+            _ = group.wait(timeout: .now() + 1)
+        }
         return nil
     }
     let data = stdout.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
     guard process.terminationStatus == 0 else {
         return nil
     }
@@ -406,7 +441,7 @@ func buildState(dataRoot: URL) -> [String: Any] {
     let todayActivity = tokenActivity(rollups: rollups)
     let recentActivity = recentTokenActivity(events: events)
     let networkActivityState = networkActivity()
-    let runningActivity = runningAgentActivity()
+    let runningActivity = cachedRunningAgentActivity()
     let views = statusViews(events: events, rollups: rollups)
     let badges = badgeInventory(events: events, goals: goals)
     let earnedBadges = badges.filter { text($0["status"]) == "earned" }
@@ -477,19 +512,19 @@ func buildState(dataRoot: URL) -> [String: Any] {
 func loadLiveUsageState(refreshUsage: Bool = true) -> [String: Any] {
     let dataRoot = activeDataRoot()
     let now = Date()
-    let recentCutoff = now.addingTimeInterval(-10 * 60)
+    let recentCutoff = now.addingTimeInterval(-liveUsageRecentWindowSeconds)
     let importedAt = isoNow()
     if refreshUsage {
         refreshUsageIfPossible(dataRoot: dataRoot)
     }
     let liveRecentEvents = liveRecentUsageEvents(since: recentCutoff, importedAt: importedAt)
-    let recentEvents = mergeUsageEvents(readRecentEvents(dataRoot: dataRoot, since: recentCutoff), with: liveRecentEvents)
+    let recentEvents = liveRecentEvents
     let statusEvents = recentEvents
     let statusRollups = buildRollups(events: statusEvents)
     let todayActivity = tokenActivity(rollups: statusRollups)
     let recentActivity = recentTokenActivity(events: recentEvents)
     let networkActivityState = networkActivity()
-    let runningActivity = runningAgentActivity()
+    let runningActivity = cachedRunningAgentActivity()
     return [
         "app": "AgentBoost",
         "repo_root": dataRoot.path,
@@ -761,6 +796,10 @@ func shouldRunUsageBackfill(dataRoot: URL) -> Bool {
         return true
     }
     return text(readUsageBackfill(dataRoot: dataRoot)["status"]) != "completed"
+}
+
+func shouldDeferUsageBackfillForActiveAgents() -> Bool {
+    !textArray(cachedRunningAgentActivity()["active_agents"]).isEmpty
 }
 
 func usageEventsFileHasData(dataRoot: URL) -> Bool {
@@ -1328,17 +1367,50 @@ func claudeUsageEvents(claudeRoot: URL, importedAt: String, since cutoff: Date? 
     return projectEvents.isEmpty ? claudeSessionMetaUsageEvents(claudeRoot: claudeRoot, importedAt: importedAt) : projectEvents
 }
 
+func allClaudeProjectFiles(projectsDir: URL) -> [URL] {
+    guard let enumerator = FileManager.default.enumerator(at: projectsDir, includingPropertiesForKeys: [.contentModificationDateKey]) else {
+        return []
+    }
+    var files: [URL] = []
+    for case let path as URL in enumerator where path.pathExtension == "jsonl" {
+        files.append(path)
+    }
+    return files
+}
+
+func recentClaudeProjectFiles(claudeRoot: URL, since cutoff: Date) -> [URL] {
+    if let cache = liveClaudeProjectFileCache,
+       cache.rootPath == claudeRoot.path,
+       Date().timeIntervalSince(cache.refreshedAt) < liveClaudeProjectFileScanIntervalSeconds {
+        return cache.files
+    }
+
+    let now = Date()
+    let projectsDir = claudeRoot.appendingPathComponent("projects", isDirectory: true)
+    let files = allClaudeProjectFiles(projectsDir: projectsDir).filter { path in
+        guard shouldImportUsageFile(path, now: now) else {
+            return false
+        }
+        guard let modifiedAt = (try? path.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else {
+            return true
+        }
+        return modifiedAt >= cutoff
+    }
+    liveClaudeProjectFileCache = (rootPath: claudeRoot.path, refreshedAt: now, files: files)
+    return files
+}
+
 func claudeProjectUsageEvents(claudeRoot: URL, importedAt: String, since cutoff: Date? = nil) -> [[String: Any]] {
     let projectsDir = claudeRoot.appendingPathComponent("projects", isDirectory: true)
-    guard let enumerator = FileManager.default.enumerator(at: projectsDir, includingPropertiesForKeys: nil) else {
-        return []
+    let projectFiles: [URL]
+    if let cutoff {
+        projectFiles = recentClaudeProjectFiles(claudeRoot: claudeRoot, since: cutoff)
+    } else {
+        projectFiles = allClaudeProjectFiles(projectsDir: projectsDir)
     }
     var events: [[String: Any]] = []
     var seenIDs = Set<String>()
-    for case let path as URL in enumerator {
-        guard path.pathExtension == "jsonl" else {
-            continue
-        }
+    for path in projectFiles {
         if cutoff != nil && !shouldImportUsageFile(path) {
             continue
         }
@@ -1450,106 +1522,135 @@ func claudeSessionMetaUsageEvents(claudeRoot: URL, importedAt: String) -> [[Stri
     return events
 }
 
+func sessionSearchRoots(sessionsDir: URL, since cutoff: Date?) -> [URL] {
+    guard let cutoff else {
+        return [sessionsDir]
+    }
+    let calendar = Calendar(identifier: .gregorian)
+    var day = calendar.startOfDay(for: cutoff)
+    let end = calendar.startOfDay(for: Date())
+    var roots: [URL] = []
+    while day <= end {
+        let components = calendar.dateComponents([.year, .month, .day], from: day)
+        if let year = components.year, let month = components.month, let dayOfMonth = components.day {
+            let root = sessionsDir
+                .appendingPathComponent(String(format: "%04d", year), isDirectory: true)
+                .appendingPathComponent(String(format: "%02d", month), isDirectory: true)
+                .appendingPathComponent(String(format: "%02d", dayOfMonth), isDirectory: true)
+            if FileManager.default.fileExists(atPath: root.path) {
+                roots.append(root)
+            }
+        }
+        guard let next = calendar.date(byAdding: .day, value: 1, to: day) else {
+            break
+        }
+        day = next
+    }
+    return roots
+}
+
 func codexUsageEvents(codexRoot: URL, importedAt: String, since cutoff: Date? = nil) -> [[String: Any]] {
     let sessionsDir = codexRoot.appendingPathComponent("sessions", isDirectory: true)
-    guard let enumerator = FileManager.default.enumerator(at: sessionsDir, includingPropertiesForKeys: nil) else {
-        return []
-    }
     var events: [[String: Any]] = []
-    for case let path as URL in enumerator {
-        guard path.pathExtension == "jsonl" else {
+    for root in sessionSearchRoots(sessionsDir: sessionsDir, since: cutoff) {
+        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) else {
             continue
         }
-        if cutoff != nil && !shouldImportUsageFile(path) {
-            continue
-        }
-        if let cutoff,
-           let modifiedAt = (try? path.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
-           modifiedAt < cutoff {
-            continue
-        }
-        guard let raw = usageFileContents(path: path, since: cutoff) else {
-            continue
-        }
-        var previousTotal: [String: Int]? = nil
-        var currentModel: String? = nil
-        var currentModelIsFallback = false
-        let lines = raw.split(separator: "\n")
-        let indexedLines: [(offset: Int, element: Substring)] = cutoff == nil
-            ? Array(lines.enumerated())
-            : Array(lines.enumerated().reversed())
-        var sawCutoffWindow = false
-        for (index, line) in indexedLines {
-            if cutoff != nil && !line.contains("\"token_count\"") && !line.contains("\"turn_context\"") {
+        for case let path as URL in enumerator {
+            guard path.pathExtension == "jsonl" else {
                 continue
             }
-            guard let data = String(line).data(using: .utf8),
-                  let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            if cutoff != nil && !shouldImportUsageFile(path) {
                 continue
             }
-            if text(row["type"]) == "turn_context" {
-                if let payload = row["payload"] as? [String: Any],
-                   let model = codexModel(from: payload) {
-                    currentModel = model
+            if let cutoff,
+               let modifiedAt = (try? path.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+               modifiedAt < cutoff {
+                continue
+            }
+            guard let raw = usageFileContents(path: path, since: cutoff) else {
+                continue
+            }
+            var previousTotal: [String: Int]? = nil
+            var currentModel: String? = nil
+            var currentModelIsFallback = false
+            let lines = raw.split(separator: "\n")
+            let indexedLines: [(offset: Int, element: Substring)] = cutoff == nil
+                ? Array(lines.enumerated())
+                : Array(lines.enumerated().reversed())
+            var sawCutoffWindow = false
+            for (index, line) in indexedLines {
+                if cutoff != nil && !line.contains("\"token_count\"") && !line.contains("\"turn_context\"") {
+                    continue
+                }
+                guard let data = String(line).data(using: .utf8),
+                      let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    continue
+                }
+                if text(row["type"]) == "turn_context" {
+                    if let payload = row["payload"] as? [String: Any],
+                       let model = codexModel(from: payload) {
+                        currentModel = model
+                        currentModelIsFallback = false
+                    }
+                    continue
+                }
+                guard text(row["type"]) == "event_msg",
+                      let payload = row["payload"] as? [String: Any],
+                      text(payload["type"]) == "token_count",
+                      let info = payload["info"] as? [String: Any] else {
+                    continue
+                }
+                let usageResult = tokenUsageFromInfo(info, previousTotal: previousTotal)
+                previousTotal = usageResult.total
+                guard let usage = usageResult.usage else { continue }
+                guard !isZeroUsage(usage) else { continue }
+                let extractedModel = codexModel(from: payload, info: info)
+                if let extractedModel {
+                    currentModel = extractedModel
                     currentModelIsFallback = false
                 }
-                continue
-            }
-            guard text(row["type"]) == "event_msg",
-                  let payload = row["payload"] as? [String: Any],
-                  text(payload["type"]) == "token_count",
-                  let info = payload["info"] as? [String: Any] else {
-                continue
-            }
-            let usageResult = tokenUsageFromInfo(info, previousTotal: previousTotal)
-            previousTotal = usageResult.total
-            guard let usage = usageResult.usage else { continue }
-            guard !isZeroUsage(usage) else { continue }
-            let extractedModel = codexModel(from: payload, info: info)
-            if let extractedModel {
-                currentModel = extractedModel
-                currentModelIsFallback = false
-            }
-            var model = extractedModel ?? currentModel
-            var modelIsFallback = false
-            if model == nil {
-                model = "gpt-5"
-                currentModel = model
-                currentModelIsFallback = true
-                modelIsFallback = true
-            } else if currentModelIsFallback && extractedModel == nil {
-                modelIsFallback = true
-            }
-            let occurredAtRaw = text(row["timestamp"]).isEmpty ? importedAt : text(row["timestamp"])
-            if let cutoff, let occurredAt = eventDate(occurredAtRaw), occurredAt < cutoff {
-                if sawCutoffWindow {
-                    break
+                var model = extractedModel ?? currentModel
+                var modelIsFallback = false
+                if model == nil {
+                    model = "gpt-5"
+                    currentModel = model
+                    currentModelIsFallback = true
+                    modelIsFallback = true
+                } else if currentModelIsFallback && extractedModel == nil {
+                    modelIsFallback = true
                 }
-                continue
+                let occurredAtRaw = text(row["timestamp"]).isEmpty ? importedAt : text(row["timestamp"])
+                if let cutoff, let occurredAt = eventDate(occurredAtRaw), occurredAt < cutoff {
+                    if sawCutoffWindow {
+                        break
+                    }
+                    continue
+                }
+                if cutoff != nil {
+                    sawCutoffWindow = true
+                }
+                var event: [String: Any] = [
+                    "event_id": "codex:\(stableID(path.path, index + 1))",
+                    "source_agent": "codex",
+                    "source_path": path.path,
+                    "source_session_id": path.deletingPathExtension().lastPathComponent,
+                    "occurred_at": occurredAtRaw,
+                    "project_path": "",
+                    "input_tokens": usage["input_tokens"] ?? 0,
+                    "cached_input_tokens": usage["cached_input_tokens"] ?? 0,
+                    "output_tokens": usage["output_tokens"] ?? 0,
+                    "reasoning_output_tokens": usage["reasoning_output_tokens"] ?? 0,
+                    "total_tokens": usage["total_tokens"] ?? 0,
+                    "record_type": "turn",
+                    "imported_at": importedAt,
+                    "model": model ?? "gpt-5",
+                ]
+                if modelIsFallback {
+                    event["model_is_fallback"] = true
+                }
+                events.append(event)
             }
-            if cutoff != nil {
-                sawCutoffWindow = true
-            }
-            var event: [String: Any] = [
-                "event_id": "codex:\(stableID(path.path, index + 1))",
-                "source_agent": "codex",
-                "source_path": path.path,
-                "source_session_id": path.deletingPathExtension().lastPathComponent,
-                "occurred_at": occurredAtRaw,
-                "project_path": "",
-                "input_tokens": usage["input_tokens"] ?? 0,
-                "cached_input_tokens": usage["cached_input_tokens"] ?? 0,
-                "output_tokens": usage["output_tokens"] ?? 0,
-                "reasoning_output_tokens": usage["reasoning_output_tokens"] ?? 0,
-                "total_tokens": usage["total_tokens"] ?? 0,
-                "record_type": "turn",
-                "imported_at": importedAt,
-                "model": model ?? "gpt-5",
-            ]
-            if modelIsFallback {
-                event["model_is_fallback"] = true
-            }
-            events.append(event)
         }
     }
     return cutoff == nil ? events : Array(events.reversed())
@@ -1668,13 +1769,12 @@ func writeUsageRefresh(_ summary: [String: Any], dataRoot: URL) throws {
 func eventDate(_ value: Any?) -> Date? {
     let raw = text(value)
     guard !raw.isEmpty else { return nil }
-    let formatter = ISO8601DateFormatter()
-    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let date = formatter.date(from: raw) {
+    eventDateFormatterLock.lock()
+    defer { eventDateFormatterLock.unlock() }
+    if let date = fractionalEventDateFormatter.date(from: raw) {
         return date
     }
-    formatter.formatOptions = [.withInternetDateTime]
-    return formatter.date(from: raw)
+    return wholeSecondEventDateFormatter.date(from: raw)
 }
 
 func totalTokens(events: [[String: Any]]) -> Int {
@@ -2200,18 +2300,19 @@ func rocketCountForAgents(_ agents: [String]) -> Int {
     return normalized.contains("claude") && normalized.contains("codex") ? 2 : 1
 }
 
+func cachedRunningAgentActivity() -> [String: Any] {
+    let now = Date()
+    if let cache = runningAgentActivityCache,
+       now.timeIntervalSince(cache.refreshedAt) < runningAgentActivityCacheIntervalSeconds {
+        return cache.state
+    }
+    let state = runningAgentActivity()
+    runningAgentActivityCache = (refreshedAt: now, state: state)
+    return state
+}
+
 func runningAgentActivity() -> [String: Any] {
-    var hints = runningProcessHints()
-    hints.append(contentsOf: NSWorkspace.shared.runningApplications.compactMap { application in
-        [
-            application.localizedName,
-            application.bundleIdentifier,
-            application.bundleURL?.path,
-            application.executableURL?.path,
-        ]
-        .compactMap { $0 }
-        .joined(separator: " ")
-    })
+    let hints = runningProcessHints()
     var agents = Set<String>()
     for hint in hints {
         let normalized = hint.lowercased()
@@ -3507,6 +3608,8 @@ final class RocketStatusView: NSView {
     private var statusViewIndex = 0
     private var statusViewSwitchedAt = Date()
     private var motionTimer: Timer?
+    private var rocketImageCache: [String: NSImage] = [:]
+    private var tokenTextImageCache: [String: NSImage] = [:]
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: rocketStatusItemWidth, height: rocketStatusItemHeight)
@@ -3537,7 +3640,7 @@ final class RocketStatusView: NSView {
         motionTimer?.invalidate()
 
         if rocketSpeed > 0 || statusViews.count > 1 {
-            let frameInterval = 1.0 / 60.0
+            let frameInterval = rocketStatusFrameIntervalSeconds
             let timer = Timer(
                 timeInterval: frameInterval,
                 target: self,
@@ -3545,7 +3648,7 @@ final class RocketStatusView: NSView {
                 userInfo: nil,
                 repeats: true
             )
-            timer.tolerance = 1.0 / 240.0
+            timer.tolerance = rocketStatusFrameIntervalSeconds / 4
             RunLoop.main.add(timer, forMode: .common)
             motionTimer = timer
         } else {
@@ -3683,13 +3786,7 @@ final class RocketStatusView: NSView {
     }
 
     private func drawEmojiRocket(at point: NSPoint, scale: CGFloat, angleDegrees: CGFloat, tint: NSColor) {
-        let rocketEmoji = "🚀" as NSString
-        let fontSize = CGFloat(13) * scale
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: fontSize),
-            .foregroundColor: tint,
-        ]
-        let emojiSize = rocketEmoji.size(withAttributes: attributes)
+        let image = cachedRocketImage(scale: scale, tint: tint)
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current?.shouldAntialias = true
         NSGraphicsContext.current?.imageInterpolation = .high
@@ -3698,21 +3795,67 @@ final class RocketStatusView: NSView {
         transform.rotate(byDegrees: angleDegrees)
         transform.translateX(by: -point.x, yBy: -point.y)
         transform.concat()
+        image.draw(
+            at: NSPoint(x: point.x - image.size.width / 2, y: point.y - image.size.height / 2),
+            from: NSRect(origin: .zero, size: image.size),
+            operation: .sourceOver,
+            fraction: 1.0
+        )
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    private func cachedRocketImage(scale: CGFloat, tint: NSColor) -> NSImage {
+        let fontSize = CGFloat(13) * scale
+        let key = String(format: "%.2f:%@", Double(fontSize), colorCacheKey(tint))
+        if let image = rocketImageCache[key] {
+            return image
+        }
+        let rocketEmoji = "🚀" as NSString
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: fontSize),
+            .foregroundColor: tint,
+        ]
+        let emojiSize = rocketEmoji.size(withAttributes: attributes)
+        let padding = CGFloat(5)
+        let imageSize = NSSize(width: ceil(emojiSize.width + padding * 2), height: ceil(emojiSize.height + padding * 2))
+        let image = NSImage(size: imageSize)
+        image.lockFocus()
+        NSGraphicsContext.current?.shouldAntialias = true
+        NSGraphicsContext.current?.imageInterpolation = .high
         let shadow = NSShadow()
         shadow.shadowColor = tint.withAlphaComponent(0.55)
         shadow.shadowBlurRadius = 3
         shadow.shadowOffset = NSSize(width: 0, height: 0)
         shadow.set()
-        rocketEmoji.draw(
-            at: NSPoint(x: point.x - emojiSize.width / 2, y: point.y - emojiSize.height / 2),
-            withAttributes: attributes
-        )
-        NSGraphicsContext.restoreGraphicsState()
+        rocketEmoji.draw(at: NSPoint(x: padding, y: padding), withAttributes: attributes)
+        image.unlockFocus()
+        rocketImageCache[key] = image
+        return image
     }
 
     private func drawTokenText(text: String, below point: NSPoint) {
         let value = text.isEmpty ? "0" : text
-        let tokenText = value as NSString
+        let image = cachedTokenTextImage(value)
+        let textSize = image.size
+        let textX = min(max(bounds.minX + 2, point.x - textSize.width / 2), bounds.maxX - textSize.width - 2)
+        let textY = max(bounds.minY + 0.5, point.y - textSize.height - 4)
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: bounds).setClip()
+        image.draw(
+            at: NSPoint(x: textX, y: textY),
+            from: NSRect(origin: .zero, size: textSize),
+            operation: .sourceOver,
+            fraction: 1.0
+        )
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    private func cachedTokenTextImage(_ value: String) -> NSImage {
+        let key = value.isEmpty ? "0" : value
+        if let image = tokenTextImageCache[key] {
+            return image
+        }
+        let tokenText = key as NSString
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 7.0, weight: .bold),
             .foregroundColor: NSColor.white,
@@ -3720,15 +3863,26 @@ final class RocketStatusView: NSView {
             .strokeColor: NSColor.black.withAlphaComponent(0.7),
         ]
         let textSize = tokenText.size(withAttributes: attributes)
-        let textX = min(max(bounds.minX + 2, point.x - textSize.width / 2), bounds.maxX - textSize.width - 2)
-        let textY = max(bounds.minY + 0.5, point.y - textSize.height - 4)
-        NSGraphicsContext.saveGraphicsState()
-        NSBezierPath(rect: bounds).setClip()
-        tokenText.draw(
-            at: NSPoint(x: textX, y: textY),
-            withAttributes: attributes
+        let imageSize = NSSize(width: ceil(textSize.width), height: ceil(textSize.height))
+        let image = NSImage(size: imageSize)
+        image.lockFocus()
+        tokenText.draw(at: .zero, withAttributes: attributes)
+        image.unlockFocus()
+        tokenTextImageCache[key] = image
+        return image
+    }
+
+    private func colorCacheKey(_ color: NSColor) -> String {
+        guard let rgb = color.usingColorSpace(.deviceRGB) else {
+            return color.description
+        }
+        return String(
+            format: "%.3f:%.3f:%.3f:%.3f",
+            Double(rgb.redComponent),
+            Double(rgb.greenComponent),
+            Double(rgb.blueComponent),
+            Double(rgb.alphaComponent)
         )
-        NSGraphicsContext.restoreGraphicsState()
     }
 }
 
@@ -6532,7 +6686,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var runningAgentRefreshTimer: Timer?
     private var lastRenderedState: [String: Any] = [:]
     private let stateQueue = DispatchQueue(label: "AgentBoost.state-refresh", qos: .utility)
+    private let runningAgentQueue = DispatchQueue(label: "AgentBoost.running-agent-refresh", qos: .utility)
     private var stateRefreshInFlight = false
+    private var runningAgentRefreshInFlight = false
     private var metaReviewInFlight = false
     private var skillPromptReviewInFlight = false
     private var identityUpdateInFlight = false
@@ -6641,7 +6797,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private func startRunningAgentRefreshTimer() {
         runningAgentRefreshTimer?.invalidate()
         let timer = Timer(
-            timeInterval: 1,
+            timeInterval: runningAgentRefreshIntervalSeconds,
             target: self,
             selector: #selector(refreshRunningAgentAnimationState(_:)),
             userInfo: nil,
@@ -6656,10 +6812,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard !lastRenderedState.isEmpty else {
             return
         }
-        let running = runningAgentActivity()
-        let renderedState = stateByApplyingRunningAgents(lastRenderedState, running: running)
-        lastRenderedState = renderedState
-        applyAnimationState(renderedState)
+        guard !runningAgentRefreshInFlight else {
+            return
+        }
+        runningAgentRefreshInFlight = true
+        runningAgentQueue.async {
+            let running = cachedRunningAgentActivity()
+            DispatchQueue.main.async {
+                self.runningAgentRefreshInFlight = false
+                guard !self.lastRenderedState.isEmpty else {
+                    return
+                }
+                let lastRenderedState = self.lastRenderedState
+                let renderedState = stateByApplyingRunningAgents(lastRenderedState, running: running)
+                self.lastRenderedState = renderedState
+                self.applyAnimationState(renderedState)
+            }
+        }
     }
 
     @objc private func refreshStatusState(_ timer: Timer) {
@@ -6676,6 +6845,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard !usageBackfillInFlight,
               shouldRunUsageBackfill(dataRoot: dataRoot),
               hasAvailableAgentUsageFolder() else {
+            return
+        }
+        if shouldDeferUsageBackfillForActiveAgents() {
+            try? writeUsageBackfill([
+                "status": "deferred",
+                "reason": "active_agents_running",
+                "deferred_at": isoNow(),
+            ], dataRoot: dataRoot, status: "deferred")
             return
         }
         usageBackfillInFlight = true
@@ -6730,11 +6907,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 } catch {
                     refreshError = error
                 }
-            } else if refreshUsage {
-                refreshUsageIfPossible(dataRoot: dataRoot)
+                let finalState = self.loadAndCacheFullDisplayState(dataRoot: dataRoot)
+                DispatchQueue.main.async {
+                    self.stateRefreshInFlight = false
+                    self.applyState(finalState)
+                    if let refreshError = refreshError {
+                        self.showAlert("Refresh Failed", refreshError.localizedDescription)
+                    }
+                }
+                return
             }
-            let finalState = loadDisplayState(refreshUsage: false)
-            writeCachedDisplayState(finalState, dataRoot: dataRoot)
+            let refreshedLiveState = loadLiveUsageState(refreshUsage: false)
+            let finalState = stateByMergingLiveUsage(fastState, liveState: refreshedLiveState)
             DispatchQueue.main.async {
                 self.stateRefreshInFlight = false
                 self.applyState(finalState)
@@ -6743,6 +6927,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 }
             }
         }
+    }
+
+    private func loadAndCacheFullDisplayState(dataRoot: URL) -> [String: Any] {
+        let finalState = loadDisplayState(refreshUsage: false)
+        writeCachedDisplayState(finalState, dataRoot: dataRoot)
+        return finalState
     }
 
     private func applyState(_ state: [String: Any]) {
@@ -7243,13 +7433,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return
         }
         let timer = Timer(
-            timeInterval: 1.0 / 30.0,
+            timeInterval: rocketScreensaverFrameIntervalSeconds,
             target: self,
             selector: #selector(advanceRocketScreensaverDisplay(_:)),
             userInfo: nil,
             repeats: true
         )
-        timer.tolerance = 1.0 / 120.0
+        timer.tolerance = rocketScreensaverFrameIntervalSeconds / 2
         RunLoop.main.add(timer, forMode: .common)
         rocketScreensaverDisplayTimer = timer
     }
@@ -7258,7 +7448,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let now = Date()
         rocketScreensaverMotionState.advance(to: now)
         rocketScreensaverViews.forEach { $0.invalidateMotionArea() }
-        if now.timeIntervalSince(lastOverlaySnapshotAt) >= 1.0 {
+        if now.timeIntervalSince(lastOverlaySnapshotAt) >= overlayRuntimeSnapshotWriteIntervalSeconds {
             lastOverlaySnapshotAt = now
             writeOverlayRuntimeSnapshot(enabled: true, capturedAt: now)
         }

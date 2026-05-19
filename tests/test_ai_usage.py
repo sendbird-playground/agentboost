@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 import subprocess
@@ -677,6 +678,75 @@ class AiUsageSystemTest(unittest.TestCase):
         self.assertIn("Source Counts", report.stdout)
         self.assertIn("Next Best Challenge", report.stdout)
         self.assertIn("Keep:", self.monthly_file.read_text(encoding="utf-8"))
+
+    def test_cli_collect_skips_when_recent_background_collect_is_fresh(self):
+        refresh_file = self.repo / "data" / "ai-usage" / "sidebar-usage-refresh.json"
+        self.write_json(
+            refresh_file,
+            {
+                "last_refreshed_at": "2026-05-06T02:00:00Z",
+                "min_interval_seconds": 300,
+                "summary": {},
+            },
+        )
+        env = {**os.environ, "PYTHONPATH": str(Path.cwd())}
+
+        collect = subprocess.run(
+            [
+                sys.executable,
+                "bin/agentboost-usage-collect",
+                "--repo-root",
+                str(self.repo),
+                "--claude-dir",
+                str(self.claude),
+                "--codex-dir",
+                str(self.codex),
+                "--now",
+                "2026-05-06T02:01:00Z",
+                "--min-interval-seconds",
+                "300",
+                "--skip-if-running",
+            ],
+            cwd=Path.cwd(),
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(collect.returncode, 0, collect.stderr)
+        self.assertIn("skipped=fresh", collect.stdout)
+        self.assertFalse(self.events_file.exists())
+
+    def test_cli_collect_skips_when_background_collect_is_already_running(self):
+        lock_file = self.repo / "data" / "ai-usage" / "ai-usage-collect.lock"
+        lock_file.parent.mkdir(parents=True)
+        env = {**os.environ, "PYTHONPATH": str(Path.cwd())}
+
+        with lock_file.open("w", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            collect = subprocess.run(
+                [
+                    sys.executable,
+                    "bin/agentboost-usage-collect",
+                    "--repo-root",
+                    str(self.repo),
+                    "--claude-dir",
+                    str(self.claude),
+                    "--codex-dir",
+                    str(self.codex),
+                    "--skip-if-running",
+                ],
+                cwd=Path.cwd(),
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(collect.returncode, 0, collect.stderr)
+        self.assertIn("skipped=running", collect.stdout)
+        self.assertFalse(self.events_file.exists())
 
     def test_cli_wrappers_work_without_pythonpath(self):
         env = dict(os.environ)
