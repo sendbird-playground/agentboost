@@ -1,0 +1,28 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local/private usage state. These files can include local token metadata,
+# badge selections, notification history, and app settings.
+data/ai-usage/*.json
+data/ai-usage/*.jsonl
+docs/ai-usage/monthly/*.md
+
+# Build outputs.
+dist/
+build/
+*.app/
+elixir/**/_build/
+elixir/**/deps/
+
+# Local editor and agent state.
+.env
+.env.*
+.codex/
+.claude/
+.agents/
+identity/drafts/
+data/turn-artifacts/

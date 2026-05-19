@@ -1,0 +1,8 @@
+[project]
+name = "agentboost"
+version = "0.1.0"
+description = "Local macOS menu-bar app for Claude and Codex usage visibility."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
