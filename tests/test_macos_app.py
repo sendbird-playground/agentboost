@@ -5,16 +5,78 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
-from unittest import mock
+from typing import Optional
 
-from agentboost.product_quality import product_quality_report, quality_exit_code
-from agentboost.macos_app import (
-    build_agentboost_app,
+from agentboost.product_quality import (
     default_agentboost_app_path,
-    final_app_icon_bytes,
     placeholder_app_icon_bytes,
+    product_quality_report,
+    quality_exit_code,
 )
+
+
+@dataclass
+class BuildResult:
+    app_path: Path
+    executable_path: Path
+    compiled: bool
+
+
+def build_agentboost_app(
+    repo_root: Path,
+    app_path: Path,
+    *,
+    compile_app: bool = True,
+    portable_profile: bool = False,
+    ad_hoc_sign: bool = False,
+    beam_release_path: Optional[Path] = None,
+    beam_elixir_version: str = "",
+    beam_otp_release: str = "",
+    swiftc: Optional[Path] = None,
+    env: Optional[dict[str, str]] = None,
+) -> BuildResult:
+    args = [
+        "bin/agentboost-build-app",
+        "--repo-root",
+        str(repo_root),
+        "--app-path",
+        str(app_path),
+    ]
+    if not compile_app:
+        args.append("--no-compile")
+    if portable_profile:
+        args.append("--portable-profile")
+    if ad_hoc_sign:
+        args.append("--ad-hoc-sign")
+    if beam_release_path is not None:
+        args.extend(["--beam-release-path", str(beam_release_path)])
+    if beam_elixir_version:
+        args.extend(["--beam-elixir-version", beam_elixir_version])
+    if beam_otp_release:
+        args.extend(["--beam-otp-release", beam_otp_release])
+    if swiftc is not None:
+        args.extend(["--swiftc", str(swiftc)])
+    run = subprocess.run(
+        args,
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    if run.returncode != 0:
+        raise AssertionError(f"{args} failed\nstdout={run.stdout}\nstderr={run.stderr}")
+    return BuildResult(
+        app_path=app_path,
+        executable_path=app_path / "Contents" / "MacOS" / "AgentBoost",
+        compiled=compile_app,
+    )
+
+
+def final_app_icon_bytes() -> bytes:
+    return (Path.cwd() / "macos" / "agentboost" / "AppIcon.icns").read_bytes()
 
 
 class MacOSAppBundleTest(unittest.TestCase):
@@ -29,6 +91,7 @@ class MacOSAppBundleTest(unittest.TestCase):
             'import Cocoa\nlet helper = repoRoot() + "/bin/agentboost"\nlet key = "AgentBoostRepoRoot"\n',
             encoding="utf-8",
         )
+        (source.parent / "AppIcon.icns").write_bytes(final_app_icon_bytes())
         self.app_path = self.root / "AgentBoost.app"
 
     def tearDown(self):
@@ -124,10 +187,23 @@ class MacOSAppBundleTest(unittest.TestCase):
         self.assertTrue(payload["com.apple.security.files.user-selected.read-only"])
 
     def test_compiled_native_app_uses_optimized_swift_build(self):
-        with mock.patch("agentboost.macos_app.subprocess.run") as run:
-            build_agentboost_app(self.repo, self.app_path, compile_app=True)
+        log = self.root / "swiftc-args.txt"
+        fake_swiftc = self.root / "swiftc"
+        fake_swiftc.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$@\" > {log}\n"
+            "while [ \"$#\" -gt 0 ]; do\n"
+            "  if [ \"$1\" = \"-o\" ]; then shift; printf '#!/bin/sh\\nexit 0\\n' > \"$1\"; chmod +x \"$1\"; exit 0; fi\n"
+            "  shift\n"
+            "done\n"
+            "exit 2\n",
+            encoding="utf-8",
+        )
+        fake_swiftc.chmod(0o755)
 
-        command = run.call_args.args[0]
+        build_agentboost_app(self.repo, self.app_path, compile_app=True, swiftc=fake_swiftc)
+
+        command = log.read_text(encoding="utf-8").splitlines()
         self.assertIn("-O", command)
         self.assertLess(command.index("-O"), command.index("-o"))
 
@@ -257,14 +333,26 @@ class MacOSAppBundleTest(unittest.TestCase):
         self.assertEqual(checks["runtime.beam_host_bridge"]["status"], "pass")
 
     def test_ad_hoc_sign_uses_bundle_entitlements_for_local_sandbox_verification(self):
-        with mock.patch("agentboost.macos_app.subprocess.run") as run:
-            build_agentboost_app(self.repo, self.app_path, compile_app=False, ad_hoc_sign=True)
+        log = self.root / "codesign-args.txt"
+        fake_bin = self.root / "bin"
+        fake_bin.mkdir()
+        fake_codesign = fake_bin / "codesign"
+        fake_codesign.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$@\" > {log}\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_codesign.chmod(0o755)
+        env = dict(os.environ)
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+
+        build_agentboost_app(self.repo, self.app_path, compile_app=False, ad_hoc_sign=True, env=env)
 
         entitlements = self.app_path / "Contents" / "Resources" / "AgentBoost.entitlements"
-        run.assert_called_once_with(
-            ["codesign", "--force", "--sign", "-", "--entitlements", str(entitlements), str(self.app_path)],
-            text=True,
-            check=True,
+        self.assertEqual(
+            log.read_text(encoding="utf-8").splitlines(),
+            ["--force", "--sign", "-", "--entitlements", str(entitlements), str(self.app_path)],
         )
 
     def test_build_app_can_bundle_existing_beam_release_contract(self):
@@ -301,7 +389,6 @@ class MacOSAppBundleTest(unittest.TestCase):
     def test_build_cli_supports_no_compile_mode(self):
         run = subprocess.run(
             [
-                sys.executable,
                 "bin/agentboost-build-app",
                 "--repo-root",
                 str(self.repo),
@@ -405,15 +492,21 @@ class MacOSAppBundleTest(unittest.TestCase):
         build_agentboost_app(self.repo, self.app_path, compile_app=False)
         icon = self.app_path / "Contents" / "Resources" / "AppIcon.icns"
         icon_bytes = icon.read_bytes()
-        source = (Path.cwd() / "agentboost" / "macos_app.py").read_text(encoding="utf-8")
+        build_script = (Path.cwd() / "bin" / "agentboost-build-app").read_text(encoding="utf-8")
 
         self.assertEqual(icon_bytes, final_app_icon_bytes())
         self.assertNotEqual(icon_bytes, placeholder_app_icon_bytes())
         self.assertTrue(icon_bytes.startswith(b"icns"))
         for chunk in (b"icp4", b"icp5", b"ic07", b"ic08", b"ic09", b"ic10"):
             self.assertIn(chunk, icon_bytes)
-        self.assertIn('AGENTBOOST_ICON_ROCKET_EMOJI = "🚀"', source)
-        self.assertIn("rocket_emoji_reference", source)
+        self.assertIn("macos/agentboost/AppIcon.icns", build_script)
+
+    def test_build_cli_is_not_a_python_wrapper(self):
+        build_script = (Path.cwd() / "bin" / "agentboost-build-app").read_text(encoding="utf-8")
+
+        self.assertFalse((Path.cwd() / "agentboost" / "macos_app.py").exists())
+        self.assertNotIn("python", build_script.lower())
+        self.assertNotIn("agentboost.macos_app", build_script)
 
     def test_product_quality_report_cli_json(self):
         build_agentboost_app(self.repo, self.app_path, compile_app=False)
@@ -2366,7 +2459,7 @@ class MacOSAppBundleTest(unittest.TestCase):
         self.assertNotIn("refreshMenu()", run_body)
         self.assertIn("writeMetaReviewArtifact", source)
         self.assertIn("Workflow Meta-Review", source)
-        self.assertIn("Completed a meta-review from the local ai-system app surface.", source)
+        self.assertIn("Completed a meta-review from the AgentBoost app surface.", source)
 
     def test_meta_review_ok_copy_uses_up_to_date_wording(self):
         source = (Path.cwd() / "macos" / "agentboost" / "AgentBoostApp.swift").read_text(encoding="utf-8")

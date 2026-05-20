@@ -8,11 +8,11 @@ import subprocess
 from pathlib import Path
 from typing import Any, Iterable
 
-from agentboost.macos_app import APP_NAME, default_agentboost_app_path, placeholder_app_icon_bytes
-
 
 Check = dict[str, Any]
+APP_NAME = "AgentBoost"
 BEAM_STATE_TIMEOUT_SECONDS = 20
+PLACEHOLDER_ICON_BYTES = b"icns\x00\x00\x00\x10ic10\x00\x00\x00\x08"
 BEAM_STATE_PARITY_FIELDS = {
     "app": str,
     "repo_root": str,
@@ -46,6 +46,15 @@ BEAM_STATE_PARITY_FIELDS = {
     "usage_refresh": dict,
     "folder_access": dict,
 }
+
+
+def default_agentboost_app_path(home: Path | None = None) -> Path:
+    home = Path(home) if home is not None else Path.home()
+    return home / "Applications" / f"{APP_NAME}.app"
+
+
+def placeholder_app_icon_bytes() -> bytes:
+    return PLACEHOLDER_ICON_BYTES
 
 
 def product_quality_report(repo_root: Path, app_path: Path | None = None) -> dict[str, Any]:
@@ -617,7 +626,7 @@ def _final_icon_check(path: Path) -> Check:
         icon_bytes = path.read_bytes()
     except OSError:
         icon_bytes = b""
-    final_icon = bool(icon_bytes) and icon_bytes != placeholder_app_icon_bytes()
+    final_icon = bool(icon_bytes) and icon_bytes.startswith(b"icns") and icon_bytes != placeholder_app_icon_bytes()
     return {
         "id": "icon.final_art",
         "status": "pass" if final_icon else "fail",

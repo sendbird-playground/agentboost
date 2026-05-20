@@ -39,7 +39,7 @@ scripts/privacy-scan.sh
 ## Commands
 
 - `bin/agentboost` opens or inspects the macOS app state.
-- `bin/agentboost-build-app` builds `AgentBoost.app`.
+- `bin/agentboost-build-app` builds `AgentBoost.app` with a shell bundle script, Swift AppKit host, and optional bundled Elixir/BEAM release.
 - `bin/agentboost-quality-check` runs product-readiness checks on a built bundle.
 - `bin/agentboost-usage-collect` imports local usage metadata.
 - `bin/agentboost-usage-goal` manages local evidence-backed goals.

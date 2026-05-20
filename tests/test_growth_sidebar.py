@@ -1272,10 +1272,10 @@ class GrowthSidebarTest(unittest.TestCase):
         self.assertIn("- Non-trivial tasks since last meta-review: 0", updated)
         self.assertIn("- Latest meta-review score: 97", updated)
         review_log = (self.repo / "skill" / "review-log.md").read_text(encoding="utf-8")
-        self.assertIn("ai-system App Meta-Review", review_log)
-        self.assertIn("Completed a meta-review from the local ai-system app surface.", review_log)
+        self.assertIn("AgentBoost App Meta-Review", review_log)
+        self.assertIn("Completed a meta-review from the AgentBoost app surface.", review_log)
         self.assertNotIn("Marked meta-review done", review_log)
-        review_artifact = self.repo / "skill" / "meta-review-2026-05-06-ai-system-app.md"
+        review_artifact = self.repo / "skill" / "meta-review-2026-05-06-agentboost-app.md"
         self.assertTrue(review_artifact.exists())
         artifact_text = review_artifact.read_text(encoding="utf-8")
         self.assertIn("# Workflow Meta-Review", artifact_text)
@@ -1516,6 +1516,7 @@ class GrowthSidebarTest(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][0], "AgentBoost meta-review due")
         self.assertIn("5 non-trivial tasks since last meta-review.", sent[0][1])
+        self.assertIn("Run it from AgentBoost when convenient.", sent[0][1])
         ledger = json.loads(self.notifications_file.read_text(encoding="utf-8"))
         self.assertIn("meta_review_prompts", ledger)
         self.assertEqual(ledger["meta_review_prompts"][0]["key"], "meta-review-due:2026-05-06:due")

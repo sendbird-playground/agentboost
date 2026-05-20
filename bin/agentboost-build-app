@@ -1,9 +1,254 @@
-#!/usr/bin/env python3
-import sys
-from pathlib import Path
+#!/usr/bin/env bash
+set -euo pipefail
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+APP_NAME="AgentBoost"
+BUNDLE_ID="com.sendbirdplayground.agentboost"
+SOURCE_REL="macos/agentboost/AgentBoostApp.swift"
+ICON_REL="macos/agentboost/AppIcon.icns"
 
-from agentboost.macos_app import build_app_main
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_root="$(cd "$script_dir/.." && pwd -P)"
+app_path="$HOME/Applications/$APP_NAME.app"
+compile_app=1
+portable_profile=0
+ad_hoc_sign=0
+beam_release_path="${AGENTBOOST_BEAM_RELEASE_PATH:-}"
+beam_elixir_version="${AGENTBOOST_BEAM_ELIXIR_VERSION:-}"
+beam_otp_release="${AGENTBOOST_BEAM_OTP_RELEASE:-}"
+swiftc_bin="swiftc"
+open_after=0
 
-raise SystemExit(build_app_main())
+usage() {
+  cat <<'USAGE'
+usage: agentboost-build-app [options]
+
+Options:
+  --repo-root PATH
+  --app-path PATH
+  --no-compile
+  --portable-profile
+  --ad-hoc-sign
+  --beam-release-path PATH
+  --beam-elixir-version VERSION
+  --beam-otp-release VERSION
+  --swiftc PATH
+  --open
+USAGE
+}
+
+expand_path() {
+  case "$1" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\n' "$HOME" "${1#~/}" ;;
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$PWD" "$1" ;;
+  esac
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g'
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --repo-root)
+      shift
+      repo_root="$(cd "$(expand_path "$1")" && pwd -P)"
+      ;;
+    --app-path)
+      shift
+      app_path="$(expand_path "$1")"
+      ;;
+    --no-compile)
+      compile_app=0
+      ;;
+    --portable-profile)
+      portable_profile=1
+      ;;
+    --ad-hoc-sign)
+      ad_hoc_sign=1
+      ;;
+    --beam-release-path)
+      shift
+      beam_release_path="$(expand_path "$1")"
+      ;;
+    --beam-elixir-version)
+      shift
+      beam_elixir_version="$1"
+      ;;
+    --beam-otp-release)
+      shift
+      beam_otp_release="$1"
+      ;;
+    --swiftc)
+      shift
+      swiftc_bin="$1"
+      ;;
+    --open)
+      open_after=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "agentboost-build-app: unknown flag: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+source_file="$repo_root/$SOURCE_REL"
+icon_source="$repo_root/$ICON_REL"
+contents="$app_path/Contents"
+macos_dir="$contents/MacOS"
+resources="$contents/Resources"
+executable="$macos_dir/$APP_NAME"
+
+if [ ! -f "$source_file" ]; then
+  echo "agentboost-build-app: missing Swift source: $source_file" >&2
+  exit 2
+fi
+if [ ! -f "$icon_source" ]; then
+  echo "agentboost-build-app: missing app icon: $icon_source" >&2
+  exit 2
+fi
+
+rm -rf "$app_path"
+mkdir -p "$macos_dir" "$resources"
+cp "$source_file" "$resources/AgentBoostApp.swift"
+cp "$icon_source" "$resources/AppIcon.icns"
+
+escaped_repo_root="$(xml_escape "$repo_root")"
+{
+  cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleExecutable</key>
+  <string>$APP_NAME</string>
+  <key>CFBundleIdentifier</key>
+  <string>$BUNDLE_ID</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>$APP_NAME</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+PLIST
+  if [ "$portable_profile" -eq 0 ]; then
+    cat <<PLIST
+  <key>AgentBoostRepoRoot</key>
+  <string>$escaped_repo_root</string>
+PLIST
+  fi
+  cat <<'PLIST'
+</dict>
+</plist>
+PLIST
+} > "$contents/Info.plist"
+
+cat <<'PLIST' > "$resources/PrivacyInfo.xcprivacy"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSPrivacyAccessedAPITypes</key>
+  <array/>
+  <key>NSPrivacyCollectedDataTypes</key>
+  <array/>
+  <key>NSPrivacyTracking</key>
+  <false/>
+  <key>NSPrivacyTrackingDomains</key>
+  <array/>
+</dict>
+</plist>
+PLIST
+
+{
+  cat <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+PLIST
+  if [ "$portable_profile" -eq 1 ]; then
+    cat <<'PLIST'
+  <key>com.apple.security.app-sandbox</key>
+  <true/>
+PLIST
+  fi
+  cat <<'PLIST'
+  <key>com.apple.security.files.user-selected.read-only</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+} > "$resources/$APP_NAME.entitlements"
+
+if [ -n "$beam_release_path" ]; then
+  beam_release_path="$(cd "$beam_release_path" && pwd -P)"
+  beam_entrypoint="$beam_release_path/bin/agentboost"
+  if [ ! -x "$beam_entrypoint" ]; then
+    echo "agentboost-build-app: missing executable BEAM release entrypoint: $beam_entrypoint" >&2
+    exit 2
+  fi
+  beam_target="$resources/beam/agentboost"
+  rm -rf "$beam_target"
+  mkdir -p "$(dirname "$beam_target")"
+  cp -R "$beam_release_path" "$beam_target"
+  cat > "$resources/AgentBoostBeamRuntime.json" <<JSON
+{
+  "elixir_version": "$beam_elixir_version",
+  "entrypoint": "beam/agentboost/bin/agentboost",
+  "mix_release": "agentboost",
+  "otp_release": "$beam_otp_release",
+  "prompt_content_ingestion": false,
+  "repo_local_helper": false,
+  "runtime": "elixir_beam",
+  "sandbox": "app_sandbox_user_selected_read_only",
+  "state_contract": "agentboost_state_v1",
+  "status_item_bridge": "native_appkit_host"
+}
+JSON
+fi
+
+if [ "$compile_app" -eq 1 ]; then
+  "$swiftc_bin" "$source_file" -O -o "$executable"
+  compiled=true
+else
+  printf '#!/bin/sh\nexit 0\n' > "$executable"
+  chmod +x "$executable"
+  compiled=false
+fi
+
+if [ "$ad_hoc_sign" -eq 1 ]; then
+  codesign --force --sign - --entitlements "$resources/$APP_NAME.entitlements" "$app_path"
+fi
+
+echo "built $app_path compiled=$compiled"
+
+if [ "$open_after" -eq 1 ]; then
+  open "$app_path"
+fi

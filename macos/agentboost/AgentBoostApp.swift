@@ -2897,9 +2897,12 @@ func notifyMetaReviewDueIfNeeded(state: [String: Any]) {
         return
     }
     let reason = text(meta["reason"]).isEmpty
-        ? "Run a workflow meta-review before more throughput."
+        ? "Meta-review is due."
         : text(meta["reason"])
-    sendAgentBoostNotification(title: "AgentBoost meta-review due", message: reason, categoryIdentifier: agentboostMetaReviewNotificationCategory)
+    let message = reason.contains("Run it from AgentBoost when convenient.")
+        ? reason
+        : "\(reason) Run it from AgentBoost when convenient."
+    sendAgentBoostNotification(title: "AgentBoost meta-review due", message: message, categoryIdentifier: agentboostMetaReviewNotificationCategory)
     prompts.append([
         "key": key,
         "notified_at": isoNow(),
@@ -3431,7 +3434,7 @@ func writeSkillPromptReviewArtifact(dataRoot: URL, today: String) throws {
         "",
         "## Review Window",
         "",
-        "- Completed by: ai-system app",
+        "- Completed by: AgentBoost app",
         "- Review date: \(today)",
         "- Skills reviewed: \(inventory.skills.count)",
         "- Prompts reviewed: \(inventory.prompts.count)",
@@ -3512,9 +3515,9 @@ func performMetaReviewState() -> Bool {
         let existingLog = (try? String(contentsOf: log, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines))
             ?? "# Workflow Review Log"
         let entry = [
-            "## \(today) ai-system App Meta-Review",
+            "## \(today) AgentBoost App Meta-Review",
             "",
-            "- Completed a meta-review from the local ai-system app surface.",
+            "- Completed a meta-review from the AgentBoost app surface.",
             "- Previous status: \(text(before["status"])) (\(text(before["reason"])))",
             "- Previous counters: tasks=\(text(before["tasks_since_last_review"])) cbs=\(text(before["circuit_breakers_since_last_review"])) repeats=\(text(before["repeated_assumption_failures"]))",
             "- Score: \(score) (status \(status))",
@@ -3537,7 +3540,7 @@ func writeMetaReviewArtifact(dataRoot: URL, today: String, before: [String: Any]
         "",
         "## Review Window",
         "",
-        "- Completed by: ai-system app",
+        "- Completed by: AgentBoost app",
         "- Review date: \(today)",
         "- Previous status: \(text(before["status"])) (\(text(before["reason"])))",
         "",
@@ -3554,7 +3557,7 @@ func writeMetaReviewArtifact(dataRoot: URL, today: String, before: [String: Any]
         "",
         "## Result",
         "",
-        "- Completed a meta-review from the local ai-system app surface.",
+        "- Completed a meta-review from the AgentBoost app surface.",
         "- Reset non-trivial task, circuit-breaker, and repeated-assumption counters after writing this artifact.",
         "",
     ].joined(separator: "\n")
@@ -3580,13 +3583,13 @@ func workflowMetaReviewDirectory(dataRoot: URL) -> URL {
 }
 
 func uniqueMetaReviewArtifactURL(skillDir: URL, today: String) -> URL {
-    let base = skillDir.appendingPathComponent("meta-review-\(today)-ai-system-app.md")
+    let base = skillDir.appendingPathComponent("meta-review-\(today)-agentboost-app.md")
     if !FileManager.default.fileExists(atPath: base.path) {
         return base
     }
     var index = 2
     while true {
-        let candidate = skillDir.appendingPathComponent("meta-review-\(today)-ai-system-app-\(index).md")
+        let candidate = skillDir.appendingPathComponent("meta-review-\(today)-agentboost-app-\(index).md")
         if !FileManager.default.fileExists(atPath: candidate.path) {
             return candidate
         }

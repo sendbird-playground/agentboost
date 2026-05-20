@@ -166,7 +166,7 @@ def perform_meta_review_from_app(repo_root: Path, *, score: int | None = None, n
     _append_app_meta_review_log(review_log, today, before, resolved_score, status)
     clear_meta_review_notification_prompts(default_notifications_file(repo_root))
     after = meta_review_state(repo_root, now)
-    after["completed_by"] = "ai-system app"
+    after["completed_by"] = "AgentBoost app"
     after["review_artifact"] = str(artifact)
     return after
 
@@ -279,7 +279,7 @@ def _write_skill_prompt_review_artifact(
             "",
             "## Review Window",
             "",
-            f"- Completed by: ai-system app",
+            f"- Completed by: AgentBoost app",
             f"- Review date: {today}",
             f"- Skills reviewed: {len(skill_paths)}",
             f"- Prompts reviewed: {len(prompt_paths)}",
@@ -712,7 +712,7 @@ def _write_identity_update_summary(
             "",
             "## Review Window",
             "",
-            "- Completed by: ai-system app",
+            "- Completed by: AgentBoost app",
             f"- Review date: {today}",
             f"- Evidence items: {drafts.evidence_items}",
             f"- Source files: {drafts.source_files}",
@@ -1190,7 +1190,7 @@ def weekly_missions(
                 "Apply one meta-review this week",
                 "The workflow improves at the class-of-problem level only when a meta-review actually lands.",
                 _mission_status(min(1, meta_count), 1),
-                "Run the configured meta-review aggregate command, fill the template, then reset the review counter with the configured workflow helper.",
+                "Use the AgentBoost meta-review Run action to write the review artifact and reset the workflow counters.",
                 "file under skill/two-phase-execution/common/meta-reviews/ dated this week",
                 cadence="weekly",
                 frequency="1/week",
@@ -2171,7 +2171,9 @@ def notify_meta_review_due(
     status = str(meta.get("status") or "due")
     last_review = str(meta.get("last_review") or state_file_raw or "unknown")
     key = f"meta-review-due:{last_review}:{status}"
-    reason = str(meta.get("reason") or "Run a workflow meta-review before more throughput.")
+    reason = str(meta.get("reason") or "Meta-review is due.")
+    if "Run it from AgentBoost when convenient." not in reason:
+        reason = f"{reason} Run it from AgentBoost when convenient."
     return _notify_once(
         Path(notification_file),
         "meta_review_prompts",
@@ -2271,19 +2273,23 @@ def launch_sidebar(repo_root: Path, *, now: str | None = None, no_notify: bool =
 
 
 def open_menu_bar_app(repo_root: Path, *, app_path: Path | None = None, rebuild: bool = False) -> int:
-    try:
-        from agentboost.macos_app import APP_NAME, build_agentboost_app, default_agentboost_app_path
-    except Exception as exc:
-        print(f"agentboost: cannot load macOS app builder: {exc}", file=sys.stderr)
-        return 2
-
     repo_root = Path(repo_root).expanduser().resolve()
-    target = Path(app_path or default_agentboost_app_path()).expanduser()
-    executable = target / "Contents" / "MacOS" / APP_NAME
+    target = Path(app_path or (Path.home() / "Applications" / "AgentBoost.app")).expanduser()
+    executable = target / "Contents" / "MacOS" / "AgentBoost"
 
     try:
         if rebuild or not executable.exists():
-            build_agentboost_app(repo_root, target)
+            subprocess.run(
+                [
+                    str(repo_root / "bin" / "agentboost-build-app"),
+                    "--repo-root",
+                    str(repo_root),
+                    "--app-path",
+                    str(target),
+                ],
+                text=True,
+                check=True,
+            )
         opened = subprocess.run(["open", str(target)], check=False)
     except (FileNotFoundError, subprocess.CalledProcessError, OSError) as exc:
         print(f"agentboost: cannot open menu bar app: {exc}", file=sys.stderr)
@@ -3204,7 +3210,7 @@ def _write_app_meta_review_artifact(
             "",
             "## Review Window",
             "",
-            f"- Completed by: ai-system app",
+            f"- Completed by: AgentBoost app",
             f"- Review date: {today}",
             f"- Previous status: {before.get('status')} ({before.get('reason')})",
             "",
@@ -3222,7 +3228,7 @@ def _write_app_meta_review_artifact(
             "",
             "## Result",
             "",
-            "- Completed a meta-review from the local ai-system app surface.",
+            "- Completed a meta-review from the AgentBoost app surface.",
             "- Reset non-trivial task, circuit-breaker, and repeated-assumption counters after writing this artifact.",
             "",
         ]
@@ -3232,12 +3238,12 @@ def _write_app_meta_review_artifact(
 
 
 def _unique_meta_review_artifact_path(skill_dir: Path, today: str) -> Path:
-    base = skill_dir / f"meta-review-{today}-ai-system-app.md"
+    base = skill_dir / f"meta-review-{today}-agentboost-app.md"
     if not base.exists():
         return base
     index = 2
     while True:
-        candidate = skill_dir / f"meta-review-{today}-ai-system-app-{index}.md"
+        candidate = skill_dir / f"meta-review-{today}-agentboost-app-{index}.md"
         if not candidate.exists():
             return candidate
         index += 1
@@ -3254,9 +3260,9 @@ def _append_app_meta_review_log(
     current = path.read_text(encoding="utf-8").rstrip() if path.exists() else "# Workflow Review Log"
     entry = "\n".join(
         [
-            f"## {today} ai-system App Meta-Review",
+            f"## {today} AgentBoost App Meta-Review",
             "",
-            "- Completed a meta-review from the local ai-system app surface.",
+            "- Completed a meta-review from the AgentBoost app surface.",
             f"- Previous status: {before.get('status')} ({before.get('reason')})",
             f"- Previous counters: tasks={before.get('tasks_since_last_review')} cbs={before.get('circuit_breakers_since_last_review')} repeats={before.get('repeated_assumption_failures')}",
             f"- Score: {score} (status {status})",

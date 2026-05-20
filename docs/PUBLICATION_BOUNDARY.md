@@ -2,7 +2,8 @@
 
 ## Product Code Included
 
-- `agentboost/`: local usage collection, mission/badge state, macOS bundle builder, and product-quality checks.
+- `agentboost/`: local usage collection, mission/badge state, and product-quality checks.
+- `bin/agentboost-build-app`: shell bundle builder for the native Swift host and optional BEAM release.
 - `macos/agentboost/AgentBoostApp.swift`: native AppKit menu-bar host.
 - `elixir/agentboost/`: bundled BEAM runtime candidate for portable state generation.
 - `bin/agentboost*`: local development and app helper commands.
