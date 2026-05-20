@@ -40,14 +40,27 @@ private let rocketScreensaverScreenInset = CGFloat(8)
 private let rocketScreensaverSeamTolerance = CGFloat(8)
 private let minimumUsageRefreshIntervalSeconds: TimeInterval = 30
 private let runningAgentRefreshIntervalSeconds: TimeInterval = 15
-private let beamStateTimeoutSeconds: TimeInterval = 12
+// Fast-poll cadence for live usage (tails ~/.claude/projects and
+// ~/.codex/sessions directly). Keeps the rocket reacting to in-flight
+// Claude/Codex activity within ~2 s while the full BEAM rollup runs every
+// `beamStateRefreshIntervalSeconds`.
+private let liveUsageRefreshIntervalSeconds: TimeInterval = 2.0
+private let beamStateTimeoutSeconds: TimeInterval = 90
+private let beamStateRefreshIntervalSeconds: TimeInterval = 90
+private let rollupStaleSecondsThreshold: TimeInterval = 30 * 60
+// BEAM defaults to one scheduler per core (14+ on a modern MBP) plus dirty
+// CPU/IO schedulers. The state CLI is mostly serial — extra schedulers don't
+// help throughput but they do peg cores and starve the menu's animation
+// timer. Cap to a small pool and run the process at background QoS so the
+// rocket animation stays smooth while BEAM is crunching.
+private let beamSchedulerErlFlags = "+S 2:2 +SDcpu 2:2 +SDio 1"
 private let usageRefreshLookbackSeconds: TimeInterval = 2 * 60 * 60
 private let liveUsageRecentWindowSeconds: TimeInterval = 2 * 60
 private let liveUsageTailBytes = UInt64(512 * 1024)
 private let liveClaudeProjectFileScanIntervalSeconds: TimeInterval = 5 * 60
 private let overlayRuntimeSnapshotWriteIntervalSeconds: TimeInterval = 5
-private let rocketStatusFrameIntervalSeconds: TimeInterval = 1.0 / 10.0
-private let rocketScreensaverFrameIntervalSeconds: TimeInterval = 1.0 / 10.0
+private let rocketStatusFrameIntervalSeconds: TimeInterval = 1.0 / 60.0
+private let rocketScreensaverFrameIntervalSeconds: TimeInterval = 1.0 / 60.0
 private let runningAgentActivityCacheIntervalSeconds: TimeInterval = 60
 private var liveClaudeProjectFileCache: (rootPath: String, refreshedAt: Date, files: [URL])?
 private var runningAgentActivityCache: (refreshedAt: Date, state: [String: Any])?
@@ -173,7 +186,33 @@ func loadState(refreshUsage: Bool = true) -> [String: Any] {
 func loadDisplayState(refreshUsage: Bool = true) -> [String: Any] {
     let fullState = loadState(refreshUsage: refreshUsage)
     let liveState = loadLiveUsageState(refreshUsage: false)
-    return stateByMergingLiveUsage(fullState, liveState: liveState)
+    var merged = stateByMergingLiveUsage(fullState, liveState: liveState)
+    annotateRollupStaleness(state: &merged, dataRoot: activeDataRoot())
+    return merged
+}
+
+// Lifetime/Month rollups come from the cached state when the BEAM CLI was
+// killed by `beamStateTimeoutSeconds` before it could refresh them. Compare
+// the cache's `cached_at` against the events.jsonl mtime so the menu can
+// flag stale numbers instead of silently serving old totals.
+func annotateRollupStaleness(state: inout [String: Any], dataRoot: URL) {
+    let eventsPath = dataRoot.appendingPathComponent("data/ai-usage/events.jsonl").path
+    guard
+        let attrs = try? FileManager.default.attributesOfItem(atPath: eventsPath),
+        let eventsMtime = attrs[.modificationDate] as? Date
+    else {
+        state["rollups_stale"] = false
+        return
+    }
+    let cacheMeta = state["state_cache"] as? [String: Any]
+    guard
+        let cachedAtRaw = cacheMeta?["cached_at"] as? String,
+        let cachedAt = eventDate(cachedAtRaw)
+    else {
+        state["rollups_stale"] = false
+        return
+    }
+    state["rollups_stale"] = eventsMtime.timeIntervalSince(cachedAt) > rollupStaleSecondsThreshold
 }
 
 func stateByMergingLiveUsage(_ fullState: [String: Any], liveState: [String: Any]) -> [String: Any] {
@@ -238,6 +277,13 @@ func loadBeamRuntimeState(dataRoot: URL) -> [String: Any]? {
     process.executableURL = executable
     process.arguments = ["eval", expression]
     process.standardOutput = stdout
+    process.qualityOfService = .background
+    var env = ProcessInfo.processInfo.environment
+    let existingFlags = env["ERL_FLAGS"] ?? ""
+    env["ERL_FLAGS"] = existingFlags.isEmpty
+        ? beamSchedulerErlFlags
+        : "\(existingFlags) \(beamSchedulerErlFlags)"
+    process.environment = env
     let group = DispatchGroup()
     process.terminationHandler = { _ in
         group.leave()
@@ -3651,7 +3697,7 @@ final class RocketStatusView: NSView {
                 userInfo: nil,
                 repeats: true
             )
-            timer.tolerance = rocketStatusFrameIntervalSeconds / 4
+            timer.tolerance = 0.002
             RunLoop.main.add(timer, forMode: .common)
             motionTimer = timer
         } else {
@@ -4269,7 +4315,10 @@ final class RocketScreensaverView: NSView {
             }
             let previousPosition = motion.position
             let rawDelta = CGFloat(now.timeIntervalSince(motion.lastFrameAt))
-            let maxFrameDelta = CGFloat(1.0 / 30.0)
+            // Clamp pathological gaps (e.g. window resume) so the rocket doesn't
+            // leap across the screen, but leave plenty of headroom for the normal
+            // 60 fps cadence and the occasional dropped frame.
+            let maxFrameDelta = CGFloat(1.0 / 15.0)
             let deltaSeconds = min(maxFrameDelta, max(CGFloat(0), rawDelta))
             motion.lastFrameAt = now
             let targetSpeed = agentRocketSpeed(agent)
@@ -5865,10 +5914,13 @@ final class AgentBoostMenuPanelView: NSView {
         let monthTokens = tokenInt(month["total_tokens"])
         let lifetimeTokens = tokenInt(lifetime["total_tokens"])
 
+        let rollupsStale = (state["rollups_stale"] as? Bool) == true
         configure(row: todayRow, label: "Today", value: agentboostFmt(todayTokens),
                   hint: tokenInt(recent["last_1m_tokens"]) > 0 ? "active" : nil)
-        configure(row: monthRow, label: "Month", value: agentboostFmt(monthTokens), hint: nil)
-        configure(row: lifetimeRow, label: "Lifetime", value: agentboostFmt(lifetimeTokens), hint: nil)
+        configure(row: monthRow, label: "Month", value: agentboostFmt(monthTokens),
+                  hint: rollupsStale ? "stale" : nil)
+        configure(row: lifetimeRow, label: "Lifetime", value: agentboostFmt(lifetimeTokens),
+                  hint: rollupsStale ? "stale" : nil)
 
         // Agent split — derive from each agent's lifetime token ledger.
         let (claudeShare, codexShare) = agentShare(state: state)
@@ -6687,11 +6739,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var statusItem: NSStatusItem?
     private var stateRefreshTimer: Timer?
     private var runningAgentRefreshTimer: Timer?
+    private var liveUsageRefreshTimer: Timer?
     private var lastRenderedState: [String: Any] = [:]
     private let stateQueue = DispatchQueue(label: "AgentBoost.state-refresh", qos: .utility)
     private let runningAgentQueue = DispatchQueue(label: "AgentBoost.running-agent-refresh", qos: .utility)
+    private let liveUsageQueue = DispatchQueue(label: "AgentBoost.live-usage", qos: .userInitiated)
     private var stateRefreshInFlight = false
     private var runningAgentRefreshInFlight = false
+    private var liveUsageRefreshInFlight = false
     private var metaReviewInFlight = false
     private var skillPromptReviewInFlight = false
     private var identityUpdateInFlight = false
@@ -6744,6 +6799,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         refreshStateInBackground(refreshUsage: true)
         startStateRefreshTimer()
         startRunningAgentRefreshTimer()
+        startLiveUsageRefreshTimer()
     }
 
     private func configureNotificationActions() {
@@ -6786,13 +6842,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private func startStateRefreshTimer() {
         stateRefreshTimer?.invalidate()
         let timer = Timer(
-            timeInterval: minimumUsageRefreshIntervalSeconds,
+            timeInterval: beamStateRefreshIntervalSeconds,
             target: self,
             selector: #selector(refreshStatusState(_:)),
             userInfo: nil,
             repeats: true
         )
-        timer.tolerance = 0.5
+        timer.tolerance = 1.0
         RunLoop.main.add(timer, forMode: .common)
         stateRefreshTimer = timer
     }
@@ -6809,6 +6865,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         timer.tolerance = 0.25
         RunLoop.main.add(timer, forMode: .common)
         runningAgentRefreshTimer = timer
+    }
+
+    private func startLiveUsageRefreshTimer() {
+        liveUsageRefreshTimer?.invalidate()
+        let timer = Timer(
+            timeInterval: liveUsageRefreshIntervalSeconds,
+            target: self,
+            selector: #selector(refreshLiveUsageActivity(_:)),
+            userInfo: nil,
+            repeats: true
+        )
+        timer.tolerance = 0.25
+        RunLoop.main.add(timer, forMode: .common)
+        liveUsageRefreshTimer = timer
+    }
+
+    @objc private func refreshLiveUsageActivity(_ timer: Timer) {
+        guard !lastRenderedState.isEmpty,
+              !liveUsageRefreshInFlight else {
+            return
+        }
+        liveUsageRefreshInFlight = true
+        liveUsageQueue.async {
+            // Cheap path: tails ~/.claude/projects and ~/.codex/sessions for
+            // events in the last ~2 min and rebuilds the activity-related
+            // fields only. The full BEAM rollup (Today / Lifetime / month) is
+            // left alone — it refreshes on its own 90 s timer.
+            let liveState = loadLiveUsageState(refreshUsage: false)
+            DispatchQueue.main.async {
+                self.liveUsageRefreshInFlight = false
+                guard !self.lastRenderedState.isEmpty else { return }
+                let merged = stateByMergingLiveUsage(self.lastRenderedState, liveState: liveState)
+                self.lastRenderedState = merged
+                self.applyAnimationState(merged)
+            }
+        }
     }
 
     @objc private func refreshRunningAgentAnimationState(_ timer: Timer) {
@@ -6910,18 +7002,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 } catch {
                     refreshError = error
                 }
-                let finalState = self.loadAndCacheFullDisplayState(dataRoot: dataRoot)
-                DispatchQueue.main.async {
-                    self.stateRefreshInFlight = false
-                    self.applyState(finalState)
-                    if let refreshError = refreshError {
-                        self.showAlert("Refresh Failed", refreshError.localizedDescription)
-                    }
-                }
-                return
             }
-            let refreshedLiveState = loadLiveUsageState(refreshUsage: false)
-            let finalState = stateByMergingLiveUsage(fastState, liveState: refreshedLiveState)
+            // Periodic refreshes used to skip the BEAM rebuild entirely — the
+            // cache stayed frozen for hours and rollups (Today / Lifetime,
+            // Codex vs. Claude split) drifted away from the events.jsonl that
+            // the external collector keeps updating. Always rebuild the full
+            // state from BEAM so the menu reflects current totals; the BEAM
+            // process runs at .background QoS so animations stay smooth.
+            let finalState = self.loadAndCacheFullDisplayState(dataRoot: dataRoot)
             DispatchQueue.main.async {
                 self.stateRefreshInFlight = false
                 self.applyState(finalState)
@@ -7442,7 +7530,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             userInfo: nil,
             repeats: true
         )
-        timer.tolerance = rocketScreensaverFrameIntervalSeconds / 2
+        // Tight tolerance keeps the floating-rocket cadence locked to ~60 fps
+        // instead of letting RunLoop coalesce wake-ups into visible stutter.
+        timer.tolerance = 0.002
         RunLoop.main.add(timer, forMode: .common)
         rocketScreensaverDisplayTimer = timer
     }
@@ -7695,21 +7785,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         var meta = runningState["meta_review"] as? [String: Any] ?? [:]
         meta["status"] = "running"
         meta["due"] = false
-        meta["reason"] = "Meta-review is running in the background."
+        meta["reason"] = "Meta-review is running…"
         runningState["meta_review"] = meta
         applyState(runningState)
         stateQueue.async {
+            let dataRoot = activeDataRoot()
             let completed = performMetaReviewState()
             if completed {
-                clearMetaReviewNotificationPrompts(dataRoot: activeDataRoot())
+                clearMetaReviewNotificationPrompts(dataRoot: dataRoot)
             }
-            let finalState = loadDisplayState(refreshUsage: false)
+            // Re-read the meta-review chip straight from the file we just
+            // rewrote. The previous version called loadDisplayState here,
+            // which re-runs the BEAM CLI (≈35 s) and made the UI look frozen
+            // for the entire duration of the "run".
+            let freshMeta: [String: Any] = completed
+                ? metaReviewState(dataRoot: dataRoot)
+                : [:]
             DispatchQueue.main.async {
                 self.metaReviewInFlight = false
-                self.applyState(finalState)
-                if !completed {
-                    self.showAlert("Meta Review Failed", "AgentBoost could not update the local meta-review files.")
+                if completed {
+                    var newState = self.lastRenderedState
+                    newState["meta_review"] = freshMeta
+                    self.applyState(newState)
+                } else {
+                    var newState = self.lastRenderedState
+                    newState["meta_review"] = metaReviewState(dataRoot: dataRoot)
+                    self.applyState(newState)
+                    self.showAlert(
+                        "Meta Review Failed",
+                        "AgentBoost could not update the local meta-review files. "
+                            + "Check that the ai-system folder is mounted and writable."
+                    )
                 }
+            }
+            // Kick a full BEAM refresh in the background so the rest of the
+            // UI catches up, but don't block the Run button on it.
+            DispatchQueue.main.async {
+                self.refreshStateInBackground(refreshUsage: false)
             }
         }
     }

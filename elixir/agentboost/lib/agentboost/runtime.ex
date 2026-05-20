@@ -155,12 +155,47 @@ defmodule Agentboost.Runtime do
     if File.exists?(path) do
       path
       |> File.stream!([], :line)
-      |> Enum.map(&String.trim/1)
+      |> Stream.map(&String.trim/1)
+      |> Stream.reject(&(&1 == ""))
+      |> Stream.map(&decode_event_line/1)
+      |> Stream.reject(&is_nil/1)
+      |> Enum.to_list()
     else
       []
     end
   rescue
     _ -> []
+  end
+
+  defp decode_event_line(line) do
+    case :json.decode(line) do
+      map when is_map(map) -> annotate_event(map)
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  # Pre-compute the parsed datetime and local date once at ingest, so the
+  # dozen downstream rollup passes don't each re-parse `occurred_at`.
+  defp annotate_event(map) do
+    case Map.get(map, "occurred_at") do
+      value when is_binary(value) and value != "" ->
+        case DateTime.from_iso8601(value) do
+          {:ok, datetime, _offset} ->
+            map
+            |> Map.put(:__datetime, datetime)
+            |> Map.put(:__local_date, local_date(datetime))
+
+          _ ->
+            map
+        end
+
+      _ ->
+        map
+    end
   end
 
   defp goals(data_root) do
@@ -239,12 +274,12 @@ defmodule Agentboost.Runtime do
         source = source_agent(event)
 
         if source in ["claude", "codex"] do
-          case event_datetime(event) do
+          case event_local_date(event) do
             nil ->
               totals
 
-            datetime ->
-              week_start = datetime |> local_date() |> sunday_week_start()
+            date ->
+              week_start = sunday_week_start(date)
 
               Map.update(
                 totals,
@@ -293,13 +328,11 @@ defmodule Agentboost.Runtime do
       source = source_agent(event)
       rollups = add_rollup_tokens(rollups, "Lifetime", tokens, source)
 
-      case event_datetime(event) do
+      case event_local_date(event) do
         nil ->
           rollups
 
-        datetime ->
-          date = local_date(datetime)
-
+        date ->
           rollups
           |> maybe_add_rollup(date == today, "Today", tokens, source)
           |> maybe_add_rollup(
@@ -658,8 +691,7 @@ defmodule Agentboost.Runtime do
 
     buckets =
       Enum.reduce(events, buckets, fn event, acc ->
-        with %DateTime{} = datetime <- event_datetime(event),
-             day <- local_date(datetime),
+        with %Date{} = day <- event_local_date(event),
              true <- Map.has_key?(acc, day),
              agent when agent in ["claude", "codex"] <- source_agent(event) do
           update_in(acc, [day, agent], &(&1 + event_total_tokens(event)))
@@ -1072,21 +1104,15 @@ defmodule Agentboost.Runtime do
   defp events_today(events) do
     today = local_today()
 
-    Enum.filter(events, fn event ->
-      case event_datetime(event) do
-        nil -> false
-        datetime -> local_date(datetime) == today
-      end
-    end)
+    Enum.filter(events, fn event -> event_local_date(event) == today end)
   end
 
   defp active_workdays_this_week(events) do
     current_week_start = sunday_week_start(local_today())
 
     events
-    |> Enum.map(&event_datetime/1)
+    |> Enum.map(&event_local_date/1)
     |> Enum.reject(&is_nil/1)
-    |> Enum.map(&local_date/1)
     |> Enum.filter(&(sunday_week_start(&1) == current_week_start and workday?(&1)))
     |> Enum.uniq()
     |> length()
@@ -1112,13 +1138,11 @@ defmodule Agentboost.Runtime do
 
     counts =
       Enum.reduce(events, %{}, fn event, acc ->
-        case event_datetime(event) do
+        case event_local_date(event) do
           nil ->
             acc
 
-          datetime ->
-            day = local_date(datetime)
-
+          day ->
             if Date.compare(day, start_day) != :lt and Date.compare(day, today) == :lt do
               Map.update(acc, day, 1, &(&1 + 1))
             else
@@ -1149,13 +1173,11 @@ defmodule Agentboost.Runtime do
 
     active_workdays_by_week =
       Enum.reduce(events, %{}, fn event, acc ->
-        case event_datetime(event) do
+        case event_local_date(event) do
           nil ->
             acc
 
-          datetime ->
-            day = local_date(datetime)
-
+          day ->
             if Date.compare(day, start_day) != :lt and
                  Date.compare(day, current_week_start) == :lt and workday?(day) do
               week_start = sunday_week_start(day)
@@ -1466,8 +1488,27 @@ defmodule Agentboost.Runtime do
     end
   end
 
-  defp event_datetime(event) do
-    case string_field(event, "occurred_at") do
+  defp event_datetime(event) when is_map(event) do
+    case Map.get(event, :__datetime) do
+      %DateTime{} = datetime ->
+        datetime
+
+      _ ->
+        case string_field(event, "occurred_at") do
+          "" ->
+            nil
+
+          value ->
+            case DateTime.from_iso8601(value) do
+              {:ok, datetime, _offset} -> datetime
+              _ -> nil
+            end
+        end
+    end
+  end
+
+  defp event_datetime(line) when is_binary(line) do
+    case string_field(line, "occurred_at") do
       "" ->
         nil
 
@@ -1478,6 +1519,21 @@ defmodule Agentboost.Runtime do
         end
     end
   end
+
+  defp event_local_date(event) when is_map(event) do
+    case Map.get(event, :__local_date) do
+      %Date{} = date ->
+        date
+
+      _ ->
+        case event_datetime(event) do
+          nil -> nil
+          datetime -> local_date(datetime)
+        end
+    end
+  end
+
+  defp event_local_date(_), do: nil
 
   defp local_today do
     {{year, month, day}, _time} = :calendar.local_time()
@@ -1501,7 +1557,20 @@ defmodule Agentboost.Runtime do
     end
   end
 
-  defp integer_field(line, field) do
+  defp integer_field(event, field) when is_map(event) do
+    case Map.get(event, field) do
+      nil -> 0
+      value when is_integer(value) -> value
+      value when is_binary(value) ->
+        case Integer.parse(value) do
+          {n, _} -> n
+          :error -> 0
+        end
+      _ -> 0
+    end
+  end
+
+  defp integer_field(line, field) when is_binary(line) do
     pattern = ~r/"#{Regex.escape(field)}"\s*:\s*(\d+)/
 
     case Regex.run(pattern, line) do
@@ -1519,7 +1588,15 @@ defmodule Agentboost.Runtime do
   defp float_value(value) when is_binary(value), do: String.to_float(value)
   defp float_value(_value), do: 0.0
 
-  defp string_field(line, field) do
+  defp string_field(event, field) when is_map(event) do
+    case Map.get(event, field) do
+      nil -> ""
+      value when is_binary(value) -> value
+      value -> to_string(value)
+    end
+  end
+
+  defp string_field(line, field) when is_binary(line) do
     pattern = ~r/"#{Regex.escape(field)}"\s*:\s*"([^"]+)"/
 
     case Regex.run(pattern, line) do
