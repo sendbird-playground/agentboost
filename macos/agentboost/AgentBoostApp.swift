@@ -844,10 +844,6 @@ func shouldRunUsageBackfill(dataRoot: URL) -> Bool {
     return text(readUsageBackfill(dataRoot: dataRoot)["status"]) != "completed"
 }
 
-func shouldDeferUsageBackfillForActiveAgents() -> Bool {
-    !textArray(cachedRunningAgentActivity()["active_agents"]).isEmpty
-}
-
 func usageEventsFileHasData(dataRoot: URL) -> Bool {
     let path = usageEventsFile(dataRoot: dataRoot)
     guard let attributes = try? FileManager.default.attributesOfItem(atPath: path.path),
@@ -6942,14 +6938,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
               hasAvailableAgentUsageFolder() else {
             return
         }
-        if shouldDeferUsageBackfillForActiveAgents() {
-            try? writeUsageBackfill([
-                "status": "deferred",
-                "reason": "active_agents_running",
-                "deferred_at": isoNow(),
-            ], dataRoot: dataRoot, status: "deferred")
-            return
-        }
+        // The earlier `shouldDeferUsageBackfillForActiveAgents` gate parked
+        // the backfill whenever Claude or Codex was running. For power users
+        // that's basically all the time, so the backfill silently never
+        // completed and Lifetime stayed undercount. Backfill is a read-only
+        // pass over jsonl files the agents have already flushed, so there's
+        // no contention worth deferring for.
         usageBackfillInFlight = true
         var runningState = lastRenderedState
         runningState["usage_backfill"] = [
