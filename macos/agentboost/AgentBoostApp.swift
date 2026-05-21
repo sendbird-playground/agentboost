@@ -1481,6 +1481,33 @@ func allClaudeProjectFiles(projectsRoots: [URL]) -> [URL] {
     return files
 }
 
+// Claude Desktop's local-agent-mode sessions write a session-root `audit.jsonl`
+// that mirrors the nested `.claude/projects` rollouts with a slightly different
+// schema (`_audit_timestamp` instead of `timestamp`, `parent_tool_use_id`
+// instead of `requestId`). On this host these files hold ~5k unique assistant
+// events / ~493M tokens with zero overlap against the nested projects tree.
+// See PRD artifact-2026-05-21-agentboost-claude-audit-jsonl.
+func discoverClaudeAuditFiles() -> [URL] {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let root = home.appendingPathComponent(
+        "Library/Application Support/Claude/local-agent-mode-sessions",
+        isDirectory: true)
+    guard FileManager.default.fileExists(atPath: root.path),
+          let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)
+    else { return [] }
+    var files: [URL] = []
+    var seen = Set<String>()
+    for case let url as URL in enumerator
+        where !url.hasDirectoryPath && url.lastPathComponent == "audit.jsonl"
+    {
+        let canonical = url.standardizedFileURL.path
+        if seen.insert(canonical).inserted {
+            files.append(url)
+        }
+    }
+    return files
+}
+
 func recentClaudeProjectFiles(claudeRoot: URL, since cutoff: Date) -> [URL] {
     if let cache = liveClaudeProjectFileCache,
        cache.rootPath == claudeRoot.path,
@@ -1565,6 +1592,102 @@ func claudeProjectUsageEvents(claudeRoot: URL, importedAt: String, since cutoff:
             }
             let sessionID = text(row["sessionId"]).isEmpty ? path.deletingPathExtension().lastPathComponent : text(row["sessionId"])
             let occurredAtRaw = text(row["timestamp"]).isEmpty ? importedAt : text(row["timestamp"])
+            if let cutoff, let occurredAt = eventDate(occurredAtRaw), occurredAt < cutoff {
+                if sawCutoffWindow {
+                    break
+                }
+                continue
+            }
+            if cutoff != nil {
+                sawCutoffWindow = true
+            }
+            var event: [String: Any] = [
+                "event_id": eventID,
+                "source_agent": "claude",
+                "source_path": path.path,
+                "source_session_id": sessionID,
+                "occurred_at": occurredAtRaw,
+                "project_path": text(row["cwd"]),
+                "input_tokens": input,
+                "cached_input_tokens": cached,
+                "output_tokens": output,
+                "reasoning_output_tokens": 0,
+                "total_tokens": totalTokens,
+                "record_type": "turn",
+                "imported_at": importedAt,
+            ]
+            let model = text(message["model"])
+            if !model.isEmpty {
+                event["model"] = model
+            }
+            if eventsByID[eventID] == nil {
+                eventOrder.append(eventID)
+            }
+            eventsByID[eventID] = event
+        }
+    }
+    // Second pass: Claude Desktop local-agent-mode session-root `audit.jsonl`
+    // files. Same `type: assistant` + `message.usage` shape but with
+    // `_audit_timestamp` instead of `timestamp` and `parent_tool_use_id`
+    // instead of `requestId`. Merge into the same eventsByID dict so
+    // streaming / cross-file dedup stays in one place. Skip when scanning
+    // with a `since` cutoff and the file's mtime is older than the cutoff —
+    // the recent-files cache only tracks the projects tree, so we honor the
+    // cutoff inline here.
+    for path in discoverClaudeAuditFiles() {
+        if cutoff != nil && !shouldImportUsageFile(path) {
+            continue
+        }
+        if let cutoff,
+           let modifiedAt = (try? path.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+           modifiedAt < cutoff {
+            continue
+        }
+        guard let raw = usageFileContents(path: path, since: cutoff) else {
+            continue
+        }
+        let lines = raw.split(separator: "\n")
+        let indexedLines: [(offset: Int, element: Substring)] = cutoff == nil
+            ? Array(lines.enumerated())
+            : Array(lines.enumerated().reversed())
+        var sawCutoffWindow = false
+        for (index, line) in indexedLines {
+            guard let data = String(line).data(using: .utf8),
+                  let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  text(row["type"]) == "assistant",
+                  let message = row["message"] as? [String: Any],
+                  let usage = message["usage"] as? [String: Any] else {
+                continue
+            }
+            let input = tokenInt(usage["input_tokens"])
+            let cacheCreation = tokenInt(usage["cache_creation_input_tokens"])
+            let cacheRead = tokenInt(usage["cache_read_input_tokens"])
+            let cached = cacheCreation + cacheRead
+            let output = tokenInt(usage["output_tokens"])
+            guard input > 0 || cached > 0 || output > 0 else {
+                continue
+            }
+            let messageID = text(message["id"])
+            let requestID = text(row["parent_tool_use_id"])
+            let eventID = !messageID.isEmpty && !requestID.isEmpty
+                ? "claude:\(stableID(messageID, requestID))"
+                : "claude:\(stableID(path.path, index + 1))"
+            let totalTokens = input + cached + output
+            if let existing = eventsByID[eventID],
+               tokenInt(existing["total_tokens"]) >= totalTokens {
+                continue
+            }
+            let sessionID = text(row["session_id"]).isEmpty
+                ? path.deletingLastPathComponent().lastPathComponent
+                : text(row["session_id"])
+            let occurredAtRaw: String
+            if !text(row["_audit_timestamp"]).isEmpty {
+                occurredAtRaw = text(row["_audit_timestamp"])
+            } else if !text(row["timestamp"]).isEmpty {
+                occurredAtRaw = text(row["timestamp"])
+            } else {
+                occurredAtRaw = importedAt
+            }
             if let cutoff, let occurredAt = eventDate(occurredAtRaw), occurredAt < cutoff {
                 if sawCutoffWindow {
                     break
