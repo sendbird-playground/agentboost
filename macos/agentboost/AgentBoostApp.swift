@@ -4465,10 +4465,22 @@ final class RocketScreensaverView: NSView {
             if splitIO {
                 return rocketEntities.map { $0.id }
             }
+            // BEAM always emits a stable `agent_usage` map with claude + codex
+            // keys, so use that as the canonical roster — that way Claude
+            // stays on screen as a parked rocket even when Codex is the only
+            // one currently producing tokens, instead of disappearing every
+            // time it goes quiet for 60 s.
+            let known = ["claude", "codex"].filter { agentUsageByAgent[$0] != nil }
+            if known.count >= 2 {
+                return known
+            }
             if rocketCount >= 2 && activeAgents.count >= 2 {
                 return Array(activeAgents.prefix(2))
             }
             if let first = activeAgents.first {
+                return [first]
+            }
+            if let first = known.first {
                 return [first]
             }
             return [""]
@@ -4538,16 +4550,22 @@ final class RocketScreensaverView: NSView {
         private func initialRocketX(for agent: String, index: Int, total: Int, minX: CGFloat, offscreenMargin: CGFloat) -> CGFloat {
             let stagger = total > 1 ? CGFloat(index) * CGFloat(96) : CGFloat(0)
             // Split-IO: every channel is a first-class tracked entity, so even
-            // idle ones (0 tokens) start onscreen as grounded rockets. This is
-            // what the user actually wants — see all 4 rockets always, with
-            // the active ones flying and the idle ones parked.
+            // idle ones (0 tokens) start onscreen as grounded rockets — see
+            // all 4 rockets, active flying, idle parked.
             if splitIO {
                 return minX + stagger
             }
-            if agentIsActiveIdle(agent) && rocketSpeed > 0 {
-                return minX + stagger
+            // Default rendered agents (claude + codex) are slot-stable, so
+            // place them onscreen at spawn time too. The only path that
+            // benefits from an offscreen entrance is an active rocket that's
+            // wrapping in from the right (handled in advanceRocketMotion);
+            // first-time placement should never sit a parked rocket behind
+            // the left bezel where the user can't see it.
+            let currentTokens = tokenInt(agentUsageByAgent[agent]?["last_1m_tokens"])
+            if rocketSpeed > 0 && currentTokens > 0 {
+                return minX - offscreenMargin - stagger
             }
-            return minX - offscreenMargin - stagger
+            return minX + stagger
         }
 
         private func agentIsActiveIdle(_ agent: String) -> Bool {
