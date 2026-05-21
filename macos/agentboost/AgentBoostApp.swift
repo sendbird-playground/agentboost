@@ -1409,13 +1409,74 @@ func claudeUsageEvents(claudeRoot: URL, importedAt: String, since cutoff: Date? 
     return projectEvents.isEmpty ? claudeSessionMetaUsageEvents(claudeRoot: claudeRoot, importedAt: importedAt) : projectEvents
 }
 
-func allClaudeProjectFiles(projectsDir: URL) -> [URL] {
-    guard let enumerator = FileManager.default.enumerator(at: projectsDir, includingPropertiesForKeys: [.contentModificationDateKey]) else {
-        return []
+// All `.claude/projects/` directories that hold Claude session jsonls. We
+// follow the same pattern as CodexBar (CLAUDE_CONFIG_DIR env + ~/.config/claude
+// + ~/.claude) and also add Claude Desktop's local-agent-mode sessions, which
+// nest their own `.claude/projects/` tree under
+// `~/Library/Application Support/Claude/local-agent-mode-sessions/`.
+func discoverClaudeProjectsRoots(primary claudeRoot: URL) -> [URL] {
+    var roots: [URL] = []
+    var seen = Set<String>()
+    func addRoot(_ url: URL) {
+        let canonical = url.standardizedFileURL.path
+        guard seen.insert(canonical).inserted else { return }
+        guard FileManager.default.fileExists(atPath: canonical) else { return }
+        roots.append(url)
     }
+
+    addRoot(claudeRoot.appendingPathComponent("projects", isDirectory: true))
+
+    if let env = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines), !env.isEmpty
+    {
+        for part in env.split(separator: ",") {
+            let raw = String(part).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !raw.isEmpty else { continue }
+            let envRoot = URL(fileURLWithPath: raw)
+            if envRoot.lastPathComponent == "projects" {
+                addRoot(envRoot)
+            } else {
+                addRoot(envRoot.appendingPathComponent("projects", isDirectory: true))
+            }
+        }
+    }
+
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    addRoot(home.appendingPathComponent(".config/claude/projects", isDirectory: true))
+
+    let localAgentSessions = home.appendingPathComponent(
+        "Library/Application Support/Claude/local-agent-mode-sessions",
+        isDirectory: true)
+    if FileManager.default.fileExists(atPath: localAgentSessions.path),
+       let enumerator = FileManager.default.enumerator(
+        at: localAgentSessions,
+        includingPropertiesForKeys: nil)
+    {
+        for case let url as URL in enumerator
+            where url.hasDirectoryPath
+                && url.lastPathComponent == "projects"
+                && url.deletingLastPathComponent().lastPathComponent == ".claude"
+        {
+            addRoot(url)
+        }
+    }
+
+    return roots
+}
+
+func allClaudeProjectFiles(projectsRoots: [URL]) -> [URL] {
     var files: [URL] = []
-    for case let path as URL in enumerator where path.pathExtension == "jsonl" {
-        files.append(path)
+    var seen = Set<String>()
+    for root in projectsRoots {
+        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else {
+            continue
+        }
+        for case let path as URL in enumerator where path.pathExtension == "jsonl" {
+            let canonical = path.standardizedFileURL.path
+            if seen.insert(canonical).inserted {
+                files.append(path)
+            }
+        }
     }
     return files
 }
@@ -1428,8 +1489,8 @@ func recentClaudeProjectFiles(claudeRoot: URL, since cutoff: Date) -> [URL] {
     }
 
     let now = Date()
-    let projectsDir = claudeRoot.appendingPathComponent("projects", isDirectory: true)
-    let files = allClaudeProjectFiles(projectsDir: projectsDir).filter { path in
+    let projectsRoots = discoverClaudeProjectsRoots(primary: claudeRoot)
+    let files = allClaudeProjectFiles(projectsRoots: projectsRoots).filter { path in
         guard shouldImportUsageFile(path, now: now) else {
             return false
         }
@@ -1443,15 +1504,22 @@ func recentClaudeProjectFiles(claudeRoot: URL, since cutoff: Date) -> [URL] {
 }
 
 func claudeProjectUsageEvents(claudeRoot: URL, importedAt: String, since cutoff: Date? = nil) -> [[String: Any]] {
-    let projectsDir = claudeRoot.appendingPathComponent("projects", isDirectory: true)
+    let projectsRoots = discoverClaudeProjectsRoots(primary: claudeRoot)
     let projectFiles: [URL]
     if let cutoff {
         projectFiles = recentClaudeProjectFiles(claudeRoot: claudeRoot, since: cutoff)
     } else {
-        projectFiles = allClaudeProjectFiles(projectsDir: projectsDir)
+        projectFiles = allClaudeProjectFiles(projectsRoots: projectsRoots)
     }
-    var events: [[String: Any]] = []
-    var seenIDs = Set<String>()
+    // Claude streams an assistant turn by appending multiple jsonl rows
+    // that share the same (message.id, requestId) — `usage` grows as the
+    // generation progresses (cache_read fills in, then output_tokens climb).
+    // The previous "first-wins" dedup latched onto the partial early row and
+    // discarded the final totals, so Claude usage was undercounted by ~50%.
+    // Track the row with the largest `total_tokens` per event id and emit
+    // that one.
+    var eventsByID: [String: [String: Any]] = [:]
+    var eventOrder: [String] = []
     for path in projectFiles {
         if cutoff != nil && !shouldImportUsageFile(path) {
             continue
@@ -1490,10 +1558,11 @@ func claudeProjectUsageEvents(claudeRoot: URL, importedAt: String, since cutoff:
             let eventID = !messageID.isEmpty && !requestID.isEmpty
                 ? "claude:\(stableID(messageID, requestID))"
                 : "claude:\(stableID(path.path, index + 1))"
-            guard !seenIDs.contains(eventID) else {
+            let totalTokens = input + cached + output
+            if let existing = eventsByID[eventID],
+               tokenInt(existing["total_tokens"]) >= totalTokens {
                 continue
             }
-            seenIDs.insert(eventID)
             let sessionID = text(row["sessionId"]).isEmpty ? path.deletingPathExtension().lastPathComponent : text(row["sessionId"])
             let occurredAtRaw = text(row["timestamp"]).isEmpty ? importedAt : text(row["timestamp"])
             if let cutoff, let occurredAt = eventDate(occurredAtRaw), occurredAt < cutoff {
@@ -1516,7 +1585,7 @@ func claudeProjectUsageEvents(claudeRoot: URL, importedAt: String, since cutoff:
                 "cached_input_tokens": cached,
                 "output_tokens": output,
                 "reasoning_output_tokens": 0,
-                "total_tokens": input + cached + output,
+                "total_tokens": totalTokens,
                 "record_type": "turn",
                 "imported_at": importedAt,
             ]
@@ -1524,10 +1593,13 @@ func claudeProjectUsageEvents(claudeRoot: URL, importedAt: String, since cutoff:
             if !model.isEmpty {
                 event["model"] = model
             }
-            events.append(event)
+            if eventsByID[eventID] == nil {
+                eventOrder.append(eventID)
+            }
+            eventsByID[eventID] = event
         }
     }
-    return events
+    return eventOrder.compactMap { eventsByID[$0] }
 }
 
 func claudeSessionMetaUsageEvents(claudeRoot: URL, importedAt: String) -> [[String: Any]] {
